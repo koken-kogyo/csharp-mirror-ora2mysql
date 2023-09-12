@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- テスト環境 -->
+<ArrayOfDBConfigData>
+  <DBConfigData>
+    <!-- EM 定義 (Oracle) -->
+    <User>KOKEN_5</User>              <!-- データベース ユーザー ID -->
+    <EncPasswd>;@=8BT+</EncPasswd>    <!-- [KCM002SF] パスワード暗号化アプリで暗号化したパスワード -->
+    <Protocol>tcp</Protocol>          <!-- 通信プロトコル -->
+    <Host>192.168.96.197</Host>       <!-- ホスト名/サーバー名または IPv4 アドレス -->
+    <Port>1521</Port>                 <!-- ポート番号 -->
+    <ServiceName>KTEST</ServiceName>  <!-- サービス名 -->
+    <Schema>KOKEN_5</Schema>          <!-- スキーマ名/データベース名 -->
+    <CharSet></CharSet>               <!-- 文字セット -->
+  </DBConfigData>
+  <DBConfigData>
+    <!-- 内製プログラム定義 (Oracle) -->
+    <User>KOKEN_5</User>              <!-- データベース ユーザー ID -->
+    <EncPasswd>;@=8BT+</EncPasswd>    <!-- [KCM002SF] パスワード暗号化アプリで暗号化したパスワード -->
+    <Protocol>tcp</Protocol>          <!-- 通信プロトコル -->
+    <Host>192.168.96.197</Host>       <!-- ホスト名/サーバー名または IPv4 アドレス -->
+    <Port>1521</Port>                 <!-- ポート番号 -->
+    <ServiceName>KTEST</ServiceName>  <!-- サービス名 -->
+    <Schema>KOKEN_5</Schema>          <!-- スキーマ名/データベース名 -->
+    <CharSet></CharSet>               <!-- 文字セット -->
+  </DBConfigData>
+  <DBConfigData>
+    <!-- 切削生産計画システム定義 (MySQL)) -->
+    <User>koken_5</User>              <!-- データベース ユーザー ID -->
+    <EncPasswd>[`]XbT+</EncPasswd>    <!-- [KCM002SF] パスワード暗号化アプリで暗号化したパスワード -->
+    <Protocol></Protocol>             <!-- 通信プロトコル -->
+    <Host>localhost</Host>            <!-- ホスト名/サーバー名または IPv4 アドレス -->
+    <Port>3306</Port>                 <!-- ポート番号 -->
+    <ServiceName></ServiceName>       <!-- サービス名 -->
+    <Schema>koken_5</Schema>          <!-- スキーマ名/データベース名 -->
+    <CharSet>utf8mb4</CharSet>        <!-- 文字セット -->
+  </DBConfigData>
+</ArrayOfDBConfigData>
