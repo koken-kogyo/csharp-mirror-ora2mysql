@@ -25,13 +25,13 @@
   </DBConfigData>
   <DBConfigData>
     <!-- 切削生産計画システム定義 (MySQL)) -->
-    <User>koken_5</User>              <!-- データベース ユーザー ID -->
-    <EncPasswd>[`]XbT+</EncPasswd>    <!-- [KCM002SF] パスワード暗号化アプリで暗号化したパスワード -->
+    <User>koken_1</User>              <!-- データベース ユーザー ID -->
+    <EncPasswd>[`]XbT'</EncPasswd>    <!-- [KCM002SF] パスワード暗号化アプリで暗号化したパスワード -->
     <Protocol></Protocol>             <!-- 通信プロトコル -->
     <Host>192.168.96.199</Host>       <!-- ホスト名/サーバー名または IPv4 アドレス -->
     <Port>3306</Port>                 <!-- ポート番号 -->
     <ServiceName></ServiceName>       <!-- サービス名 -->
-    <Schema>koken_5</Schema>          <!-- スキーマ名/データベース名 -->
+    <Schema>koken_1</Schema>          <!-- スキーマ名/データベース名 -->
     <CharSet>utf8mb4</CharSet>        <!-- 文字セット -->
   </DBConfigData>
 </ArrayOfDBConfigData>
