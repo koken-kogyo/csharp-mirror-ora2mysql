@@ -47,10 +47,10 @@ namespace MirrorOra2MySQL
             // 
             DBOpen();
             M0010();
+            M0200();
             M0230();
             M0220();
             M0210();
-            M0200();
             M0300();
             M0310();
             M0400();
@@ -59,6 +59,7 @@ namespace MirrorOra2MySQL
             M0520();
             M0570();
             M0510();
+            M0600();
             connOracle.Close();
             connMySQL.Close();
             if (AssemblyState.IsDebug)
@@ -78,6 +79,7 @@ namespace MirrorOra2MySQL
             var userid = dbconfig[0].User;      // "KOKEN_5";
             var password = decPasswd;           //
             var datasource = $"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=KTEST)))";
+            Console.WriteLine($"Oracle[HOST:{host}/UserID:{userid}]");
             return $"User Id={userid};Password={password};Data Source={datasource}";
         }
 
@@ -91,6 +93,7 @@ namespace MirrorOra2MySQL
             var password = decPasswd;           // 
             var database = dbconfig[2].Schema;  // "koken_1"
             var port = dbconfig[2].Port;        // 3306 or 53306
+            Console.WriteLine($"MySQL [HOST:{host}/UserID:{userid}]");
             return $"Server={host};User ID={userid};Password={password};Database={database};Port={port};";
         }
 
@@ -1128,10 +1131,14 @@ namespace MirrorOra2MySQL
             // OracleRowを一件ずつループ
             var countInsert = 0;
             var countUpdate = 0;
+            var countDelete = 0;
             foreach (DataRow row in dtOra.Rows)
             {
                 var oyahmcd = row["OYAHMCD"].ToString();
                 var seq = row["SEQ"].ToString();
+                var ktcd = row["KTCD"].ToString();
+                var kohmcd = row["KOHMCD"].ToString();
+                var valdtf = row["VALDTF"].ToString();
                 var sql = $" select * from m0520 where OYAHMCD='{oyahmcd}' and SEQ={seq} ";
                 var adapter = new MySqlDataAdapter();
                 adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
@@ -1170,6 +1177,27 @@ namespace MirrorOra2MySQL
                         dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
                         if (isDisp) Console.WriteLine($"Update {oyahmcd} - {seq}");
                         countUpdate++;
+
+                        // 以下の対策 2023-10-17 y.w
+                        // 品目構成マスタも更新時削除されることが判明
+                        // ⇒ ①データベース制約にKTSEQを追加して対処
+                        // ⇒ ②削除明細を検索しあれば削除
+                        /*
+                        var sqlDel = $" select * from m0520 where OYAHMCD='{oyahmcd}' and KTCD='{ktcd}' and KOHMCD='{kohmcd}' and VALDTF='{valdtf}'";
+                        var adapterDel = new MySqlDataAdapter();
+                        adapterDel.SelectCommand = new MySqlCommand(sqlDel, connMySQL);
+                        var buiderDel = new MySqlCommandBuilder(adapterDel);
+                        var dtDelete = new DataTable();
+                        adapterDel.Fill(dtDelete);
+                        if (dtDelete.Rows.Count != 0)
+                        {
+                            if (isDisp)
+                                Console.WriteLine($"Delete {oyahmcd.PadRight(24)} - {ktcd} - {kohmcd} - {valdtf}");
+                            dtDelete.Rows[0].Delete();
+                            if (isUpdate) adapter.Update(dtDelete);
+                            countDelete++;
+                        }
+                        */
                     }
                 }
                 // 追加更新を実行
@@ -1182,6 +1210,7 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
                 Console.WriteLine("　　更新件数：" + String.Format("{0:#,0}", countUpdate) + " 件");
+                Console.WriteLine("　　削除件数：" + String.Format("{0:#,0}", countDelete) + " 件");
             }
             else
             {
@@ -1402,6 +1431,75 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
                 Console.WriteLine("　　更新件数：" + String.Format("{0:#,0}", countUpdate) + " 件");
                 Console.WriteLine("　　削除件数：" + String.Format("{0:#,0}", countDelete) + " 件");
+            }
+            else
+            {
+                Console.WriteLine("更新はありませんでした．".PadLeft(18));
+            }
+        }
+        // M0600 受注品マスタ
+        private static void M0600()
+        {
+            Console.WriteLine(Common.MSG_SEPARATOR);
+            Console.WriteLine($"M0600 受注品マスタチェック開始 ({day}日間)");
+            Console.WriteLine(Common.MSG_SEPARATOR);
+            // Oracle
+            var dtOra = new DataTable();
+            var sqlOra = $"select * from M0600 where updtdt > SYSDATE - {day}";
+            var oracleCommand = new OracleCommand(sqlOra);
+            oracleCommand.Connection = connOracle;
+            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
+            dtOra.Load(oracleReader);
+            // MySQL TKCD, TKHMCD を全件取得
+            var dtMySQL = new DataTable();
+            var sqlMySQL = "select TKCD, TKHMCD from M0600";
+            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            myDa.Fill(dtMySQL);
+            // OracleRowを一件ずつループ
+            var countInsert = 0;
+            var countUpdate = 0;
+            foreach (DataRow row in dtOra.Rows)
+            {
+                var tkcd = row["TKCD"].ToString();
+                var tkhmcd = row["TKHMCD"].ToString();
+                var sql = $" select * from m0600 where TKCD='{tkcd}' and TKHMCD='{tkhmcd}'";
+                var adapter = new MySqlDataAdapter();
+                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
+                var buider = new MySqlCommandBuilder(adapter);
+                var dtUpdate = new DataTable();
+                adapter.Fill(dtUpdate);
+
+                if (dtMySQL.Select($"TKCD='{tkcd}' and TKHMCD='{tkhmcd}'").Count() == 0)
+                {
+                    dtUpdate.ImportRow(row);
+                    dtUpdate.Rows[0].SetAdded();
+                    if (isDisp) Console.WriteLine($"Insert {tkcd} - {tkhmcd}");
+                    countInsert++;
+                }
+                else
+                {
+                    if (row["HMCD"].ToString() != dtUpdate.Rows[0]["HMCD"].ToString() ||
+                        row["TKLT"].ToString() != dtUpdate.Rows[0]["TKLT"].ToString()
+                        )
+                    {
+                        dtUpdate.Rows[0]["HMCD"] = row["HMCD"];
+                        dtUpdate.Rows[0]["TKLT"] = row["TKLT"];
+                        dtUpdate.Rows[0]["UPDTID"] = "11014";
+                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        if (isDisp) Console.WriteLine($"Update {tkcd} - {tkhmcd}");
+                        countUpdate++;
+                    }
+                }
+                // 追加更新を実行
+                if (isUpdate) adapter.Update(dtUpdate);
+            }
+            // 結果
+            if (countInsert + countUpdate > 0)
+            {
+                if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
+                Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
+                Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
+                Console.WriteLine("　　更新件数：" + String.Format("{0:#,0}", countUpdate) + " 件");
             }
             else
             {
