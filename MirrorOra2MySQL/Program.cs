@@ -51,6 +51,7 @@ namespace MirrorOra2MySQL
             M0230();
             M0220();
             M0210();
+            M0330();
             M0300();
             M0310();
             M0400();
@@ -519,6 +520,82 @@ namespace MirrorOra2MySQL
                         dtUpdate.Rows[0]["UPDTID"] = "11014";
                         dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
                         if (isDisp) Console.WriteLine($"Update {tkcd}");
+                        countUpdate++;
+                    }
+                }
+                // 追加更新を実行
+                if (isUpdate) adapter.Update(dtUpdate);
+            }
+            // 結果
+            if (countInsert + countUpdate > 0)
+            {
+                if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
+                Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
+                Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
+                Console.WriteLine("　　更新件数：" + String.Format("{0:#,0}", countUpdate) + " 件");
+            }
+            else
+            {
+                Console.WriteLine("更新はありませんでした．".PadLeft(18));
+            }
+        }
+        // M0330 手配先管理マスタ
+        private static void M0330()
+        {
+            Console.WriteLine(Common.MSG_SEPARATOR);
+            Console.WriteLine("M0330 手配先管理マスタチェック開始");
+            Console.WriteLine(Common.MSG_SEPARATOR);
+            // Oracle
+            var dtOra = new DataTable();
+            var sqlOra = $"select * from M0330";
+            var oracleCommand = new OracleCommand(sqlOra);
+            oracleCommand.Connection = connOracle;
+            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
+            dtOra.Load(oracleReader);
+            // MySQL ODCTLNOを全件取得
+            var dtMySQL = new DataTable();
+            var sqlMySQL = "select ODCTLNO from M0330";
+            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            myDa.Fill(dtMySQL);
+            // OracleRowを一件ずつループ
+            var countInsert = 0;
+            var countUpdate = 0;
+            foreach (DataRow row in dtOra.Rows)
+            {
+                var odctlno= row["ODCTLNO"].ToString();
+                var sql = $" select * from m0330 where ODCTLNO='{odctlno}'";
+                var adapter = new MySqlDataAdapter();
+                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
+                var buider = new MySqlCommandBuilder(adapter);
+                var dtUpdate = new DataTable();
+                adapter.Fill(dtUpdate);
+
+                if (dtMySQL.Select($"ODCTLNO='{odctlno}'").Count() == 0)
+                {
+                    dtUpdate.ImportRow(row);
+                    dtUpdate.Rows[0].SetAdded();
+                    if (isDisp) Console.WriteLine($"Insert {odctlno}");
+                    countInsert++;
+                }
+                else
+                {
+                    if (row["ODCTLNM"].ToString() != dtUpdate.Rows[0]["ODCTLNM"].ToString() ||
+                        row["ODLT"].ToString() != dtUpdate.Rows[0]["ODLT"].ToString() ||
+                        row["KTDAY"].ToString() != dtUpdate.Rows[0]["KTDAY"].ToString() ||
+                        row["NJDAY"].ToString() != dtUpdate.Rows[0]["NJDAY"].ToString() ||
+                        row["CALTYP"].ToString() != dtUpdate.Rows[0]["CALTYP"].ToString() ||
+                        row["JITOKTDAY"].ToString() != dtUpdate.Rows[0]["JITOKTDAY"].ToString()
+                        )
+                    {
+                        dtUpdate.Rows[0]["ODCTLNM"] = row["ODCTLNM"];
+                        dtUpdate.Rows[0]["ODLT"] = row["ODLT"];
+                        dtUpdate.Rows[0]["KTDAY"] = row["KTDAY"];
+                        dtUpdate.Rows[0]["NJDAY"] = row["NJDAY"];
+                        dtUpdate.Rows[0]["CALTYP"] = row["CALTYP"];
+                        dtUpdate.Rows[0]["JITOKTDAY"] = row["JITOKTDAY"];
+                        dtUpdate.Rows[0]["UPDTID"] = "11014";
+                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        if (isDisp) Console.WriteLine($"Update {odctlno}");
                         countUpdate++;
                     }
                 }

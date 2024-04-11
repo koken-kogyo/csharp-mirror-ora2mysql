@@ -92,9 +92,6 @@
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
     <PostBuildEvent>mkdir $(SolutionDir)Koken\$(SolutionName)
-xcopy  /y $(SolutionDir)settingfiles\!DispOnly.bat $(TargetDir)
-xcopy  /y $(SolutionDir)settingfiles\!Kick.bat $(TargetDir)
-xcopy  /y $(SolutionDir)settingfiles\ConfigDB.xml  $(TargetDir)
 xcopy /y $(TargetDir)* $(SolutionDir)Koken\$(SolutionName)
 </PostBuildEvent>
   </PropertyGroup>
