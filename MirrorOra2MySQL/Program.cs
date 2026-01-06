@@ -46,6 +46,7 @@ namespace MirrorOra2MySQL
             }
             // 
             DBOpen();
+            S0820();
             M0010();
             M0200();
             M0230();
@@ -79,7 +80,7 @@ namespace MirrorOra2MySQL
             var host = dbconfig[0].Host;        // "192.168.3.197";
             var userid = dbconfig[0].User;      // "KOKEN_5";
             var password = decPasswd;           //
-            var datasource = $"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=KTEST)))";
+            var datasource = $"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=KOKEN)))";
             Console.WriteLine($"Oracle[HOST:{host}/UserID:{userid}]");
             return $"User Id={userid};Password={password};Data Source={datasource}";
         }
@@ -176,6 +177,71 @@ namespace MirrorOra2MySQL
                         dtUpdate.Rows[0]["UPDTID"] = "11014";
                         dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
                         if (isDisp) Console.WriteLine($"Update {tancd}");
+                        countUpdate++;
+                    }
+                }
+                // 追加更新を実行
+                if (isUpdate) adapter.Update(dtUpdate);
+            }
+            // 結果
+            if (countInsert + countUpdate > 0)
+            {
+                if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
+                Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
+                Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
+                Console.WriteLine("　　更新件数：" + String.Format("{0:#,0}", countUpdate) + " 件");
+            }
+            else
+            {
+                Console.WriteLine("更新はありませんでした．".PadLeft(18));
+            }
+        }
+        // S0820 カレンダーマスタ
+        private static void S0820()
+        {
+            Console.WriteLine(Common.MSG_SEPARATOR);
+            Console.WriteLine("S0820 カレンダーマスタチェック開始");
+            Console.WriteLine(Common.MSG_SEPARATOR);
+            // Oracle
+            var dtOra = new DataTable();
+            var sqlOra = $"select * from S0820 where CALTYP='00001' and YMD > '2024/10/1'";
+            var oracleCommand = new OracleCommand(sqlOra);
+            oracleCommand.Connection = connOracle;
+            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
+            dtOra.Load(oracleReader);
+            // MySQL YMD対象を取得
+            var dtMySQL = new DataTable();
+            var sqlMySQL = "select YMD from S0820 where CALTYP='00001' and YMD > '2024/10/1'";
+            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            myDa.Fill(dtMySQL);
+            // OracleRowを一件ずつループ
+            var countInsert = 0;
+            var countUpdate = 0;
+            foreach (DataRow row in dtOra.Rows)
+            {
+                var ymd = row["YMD"].ToString();
+                var sql = $" select * from S0820 where CALTYP='00001' and YMD='{ymd}'";
+                var adapter = new MySqlDataAdapter();
+                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
+                var buider = new MySqlCommandBuilder(adapter);
+                var dtUpdate = new DataTable();
+                adapter.Fill(dtUpdate);
+
+                if (dtMySQL.Select($"YMD='{ymd}'").Count() == 0)
+                {
+                    dtUpdate.ImportRow(row);
+                    dtUpdate.Rows[0].SetAdded();
+                    if (isDisp) Console.WriteLine($"Insert {ymd}");
+                    countInsert++;
+                }
+                else
+                {
+                    if (row["WKKBN"].ToString() != dtUpdate.Rows[0]["WKKBN"].ToString())
+                    {
+                        dtUpdate.Rows[0]["WKKBN"] = row["WKKBN"];
+                        dtUpdate.Rows[0]["UPDTID"] = "11014";
+                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        if (isDisp) Console.WriteLine($"Update {ymd}");
                         countUpdate++;
                     }
                 }
@@ -1383,7 +1449,8 @@ namespace MirrorOra2MySQL
                 var dtUpdate = new DataTable();
                 adapter.Fill(dtUpdate);
 
-                if (dtMySQL.Select($"HMCD='{hmcd}' and VALDTF='{valdtf}' and KTSEQ={ktseq}").Count() == 0)
+                if (dtMySQL.Select($"HMCD='{hmcd}' and VALDTF='{valdtf}' and KTSEQ={ktseq}").Count() == 0
+                 || dtUpdate.Rows.Count == 0)
                 {
                     dtUpdate.ImportRow(row);
                     dtUpdate.Rows[0].SetAdded();
