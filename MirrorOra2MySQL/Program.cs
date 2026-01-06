@@ -1,9 +1,9 @@
-﻿using System;
-using System.Linq;
-using Oracle.ManagedDataAccess.Client;
+﻿using DecryptPassword;
 using MySql.Data.MySqlClient;
+using Oracle.ManagedDataAccess.Client;
+using System;
 using System.Data;
-using DecryptPassword;
+using System.Linq;
 
 namespace MirrorOra2MySQL
 {
@@ -130,17 +130,18 @@ namespace MirrorOra2MySQL
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0010 担当者マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
-            // Oracle
+            // Oracle を全件取得
             var dtOra = new DataTable();
             var sqlOra = $"select * from M0010";
             var oracleCommand = new OracleCommand(sqlOra);
             oracleCommand.Connection = connOracle;
             OracleDataReader oracleReader = oracleCommand.ExecuteReader();
             dtOra.Load(oracleReader);
-            // MySQL TANCDを全件取得
+            // MySQL を全件取得
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select TANCD from M0010";
+            var sqlMySQL = "select * from M0010";
             var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
             // OracleRowを一件ずつループ
             var countInsert = 0;
@@ -148,44 +149,47 @@ namespace MirrorOra2MySQL
             foreach (DataRow row in dtOra.Rows)
             {
                 var tancd = row["TANCD"].ToString();
-                var sql = $" select * from m0010 where TANCD='{tancd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
-
-                if (dtMySQL.Select($"TANCD='{tancd}'").Count() == 0)
+                var r = dtMySQL.Select($"TANCD='{tancd}'");
+                if (r.Count() == 0)
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    DataRow newRow = dtMySQL.NewRow();
+                    newRow["TANCD"] = row["TANCD"];
+                    newRow["TANNM"] = row["TANNM"];
+                    newRow["PASSWD"] = row["PASSWD"];
+                    newRow["ATGCD"] = row["ATGCD"];
+                    newRow["INSTID"] = row["INSTID"];
+                    newRow["INSTDT"] = row["INSTDT"];
+                    newRow["UPDTID"] = row["UPDTID"];
+                    newRow["UPDTDT"] = row["UPDTDT"];
+                    dtMySQL.Rows.Add(newRow);
                     if (isDisp) Console.WriteLine($"Insert {tancd}");
                     countInsert++;
                 }
                 else
                 {
-                    var mysTANNM = dtUpdate.Rows[0]["TANNM"].ToString().Replace("_5", "");
+                    var mysTANNM = r[0]["TANNM"].ToString().Replace("_5", "");
                     var oraTANNM = row["TANNM"].ToString().Replace("_5", "");
                     if (oraTANNM != mysTANNM ||
-                        row["PASSWD"].ToString() != dtUpdate.Rows[0]["PASSWD"].ToString() ||
-                        row["ATGCD"].ToString() != dtUpdate.Rows[0]["ATGCD"].ToString()
+                        row["PASSWD"].ToString() != r[0]["PASSWD"].ToString() ||
+                        row["ATGCD"].ToString() != r[0]["ATGCD"].ToString() ||
+                        row["UPDTID"].ToString() != r[0]["UPDTID"].ToString() ||
+                        row["UPDTDT"].ToString() != r[0]["UPDTDT"].ToString()
                         )
                     {
-                        dtUpdate.Rows[0]["TANNM"] = row["TANNM"];
-                        dtUpdate.Rows[0]["PASSWD"] = row["PASSWD"];
-                        dtUpdate.Rows[0]["ATGCD"] = row["ATGCD"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        r[0]["TANNM"] = row["TANNM"];
+                        r[0]["PASSWD"] = row["PASSWD"];
+                        r[0]["ATGCD"] = row["ATGCD"];
+                        r[0]["UPDTID"] = row["UPDTID"];
+                        r[0]["UPDTDT"] = row["UPDTDT"];
                         if (isDisp) Console.WriteLine($"Update {tancd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
-            // 結果
+            // 追加更新を実行
             if (countInsert + countUpdate > 0)
             {
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
