@@ -70,6 +70,41 @@ namespace MirrorOra2MySQL
         public string CharSet { get; set; }     // 文字セット
     }
 
+    public static class ParseExtensions
+    {
+        public static double ToDoubleSafe(this object value, double defaultValue = 0)
+        {
+            if (value == null || value == DBNull.Value) return defaultValue;
+            if (double.TryParse(value.ToString(), out double result))
+                return result;
+            return defaultValue;
+        }
+        public static int? ToIntNullable(this object value)
+        {
+            if (value == null || value == DBNull.Value)
+                return null;
+
+            if (int.TryParse(value.ToString(), out int result))
+                return result;
+
+            return null;
+        }
+    }
+
+    public static class CompareExtensions
+    {
+        private const double EPS = 0.0000001;
+        public static bool NearlyEquals(this double a, double b)
+        {
+            return Math.Abs(a - b) < EPS;
+        }
+        public static bool IntEquals(this int? a, int? b)
+        {
+            if (a == null && b == null) return true;
+            if (a == null || b == null) return false;
+            return a.Value == b.Value;
+        }
+    }
 
     internal static class AssemblyState
     {

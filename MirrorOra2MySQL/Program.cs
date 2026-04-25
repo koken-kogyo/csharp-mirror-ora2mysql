@@ -1,9 +1,15 @@
 ﻿using DecryptPassword;
 using MySql.Data.MySqlClient;
+using Mysqlx.Crud;
 using Oracle.ManagedDataAccess.Client;
 using System;
+using System.Collections.Generic;
 using System.Data;
+using System.Data.SqlClient;
 using System.Linq;
+using System.Runtime.Serialization.Formatters;
+using System.Text;
+using static Mysqlx.Expect.Open.Types.Condition.Types;
 
 namespace MirrorOra2MySQL
 {
@@ -15,6 +21,7 @@ namespace MirrorOra2MySQL
         private static int day = 0;
         private static bool isUpdate = false;
         private static bool isDisp = false;
+        private static bool isMaintenance = false;
 
         static void Main(string[] args)
         {
@@ -37,15 +44,21 @@ namespace MirrorOra2MySQL
                 day = _day;
             }
             // 実行モード
-            if (args.Length == 2 && args[1].ToString().ToUpper() == "/E")
+            if (args.Length >= 2 && args[1].ToString().ToUpper() == "/E")
             {
                 isUpdate = true;
-            } else if (args.Length == 2 && args[1].ToString().ToUpper() == "/D")
+            } else if (args.Length >= 2 && args[1].ToString().ToUpper() == "/D")
             {
                 isDisp= true;
             }
+            // メンテナンスモード
+            if (args.Length >= 3 && args[2].ToString().ToUpper() == "/M")
+            {
+                isMaintenance = true;
+            }
             // 
             DBOpen();
+            if (isMaintenance) M0510_MaintenanceCopy_Bulk();
             S0820();
             M0010();
             M0200();
@@ -73,35 +86,35 @@ namespace MirrorOra2MySQL
         }
 
         // Oracle 接続文字列
-        private static string getOracleConnectionString()
+        private static string GetOracleConnectionString()
         {
             var dpc = new DecryptPasswordClass();
             dpc.DecryptPassword(dbconfig[0].EncPasswd, out string decPasswd);
-            var host = dbconfig[0].Host;        // "192.168.3.197";
-            var userid = dbconfig[0].User;      // "KOKEN_5";
-            var password = decPasswd;           //
+            var host = dbconfig[0].Host;
+            var userid = dbconfig[0].User;
+            var password = decPasswd;
             var datasource = $"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=KOKEN)))";
             Console.WriteLine($"Oracle[HOST:{host}/UserID:{userid}]");
             return $"User Id={userid};Password={password};Data Source={datasource}";
         }
 
         // MySQL 接続文字列作成
-        private static string getMySQLConnectionString()
+        private static string GetMySQLConnectionString()
         {
             var dpc = new DecryptPasswordClass();
             dpc.DecryptPassword(dbconfig[2].EncPasswd, out string decPasswd);
-            var host = dbconfig[2].Host;        // "localhost" or "192.168.96.199" or "192.168.3.197"
-            var userid = dbconfig[2].User;      // "koken_1"
-            var password = decPasswd;           // 
-            var database = dbconfig[2].Schema;  // "koken_1"
-            var port = dbconfig[2].Port;        // 3306 or 53306
+            var host = dbconfig[2].Host;
+            var userid = dbconfig[2].User;
+            var password = decPasswd;
+            var database = dbconfig[2].Schema;
+            var port = dbconfig[2].Port;
             Console.WriteLine($"MySQL [HOST:{host}/UserID:{userid}]");
             return $"Server={host};User ID={userid};Password={password};Database={database};Port={port};";
         }
 
         private static void DBOpen()
         {
-            connOracle = new OracleConnection(getOracleConnectionString());
+            connOracle = new OracleConnection(GetOracleConnectionString());
             try
             {
                 connOracle.Open();
@@ -112,7 +125,7 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("Oracleデータベースへ接続できませんでした．\r\n" + ex.Message.ToString());
                 Environment.Exit(1);
             }
-            connMySQL = new MySqlConnection(getMySQLConnectionString());
+            connMySQL = new MySqlConnection(GetMySQLConnectionString());
             try
             {
                 connMySQL.Open();
@@ -124,63 +137,100 @@ namespace MirrorOra2MySQL
                 Environment.Exit(1);
             }
         }
-        // M0010 担当者マスタ
+        //
+        // NULL 安全比較（ObjectEquals）
+        // Double / int / decimal / DateTime / string / NULL
+        // 全部これで比較できます。
+        //
+        private static bool ObjectEquals(object a, object b)
+        {
+            if (a == DBNull.Value) a = null;
+            if (b == DBNull.Value) b = null;
+
+            if (a == null && b == null) return true;
+            if (a == null || b == null) return false;
+
+            // Oracle NUMBER(5,1) → double
+            // MySQL decimal(5,1) → decimal
+            // → 両方 decimal に寄せて比較
+            if (IsNumeric(a) && IsNumeric(b))
+            {
+                decimal da = Convert.ToDecimal(a);
+                decimal db = Convert.ToDecimal(b);
+                return da == db;
+            }
+
+            // DateTime
+            if (a is DateTime ta && b is DateTime tb)
+                return ta == tb;
+
+            // その他は文字列比較
+            return a.ToString() == b.ToString();
+        }
+
+        private static bool IsNumeric(object value)
+        {
+            return value is sbyte || value is byte ||
+                   value is short || value is ushort ||
+                   value is int || value is uint ||
+                   value is long || value is ulong ||
+                   value is float || value is double ||
+                   value is decimal;
+        }
+        // M0010 担当者マスタ（200件）
         private static void M0010()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0010 担当者マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
-            // Oracle を全件取得
+
+            // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0010";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL を全件取得
+            dtOra.Load(new OracleCommand("select * from M0010", connOracle).ExecuteReader());
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select * from M0010";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0010", connMySQL);
             var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["TANCD"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var tancd = row["TANCD"].ToString();
-                var r = dtMySQL.Select($"TANCD='{tancd}'");
-                if (r.Count() == 0)
+                var tancd = oraRow["TANCD"].ToString();
+                var key = tancd;
+
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    DataRow newRow = dtMySQL.NewRow();
-                    newRow["TANCD"] = row["TANCD"];
-                    newRow["TANNM"] = row["TANNM"];
-                    newRow["PASSWD"] = row["PASSWD"];
-                    newRow["ATGCD"] = row["ATGCD"];
-                    newRow["INSTID"] = row["INSTID"];
-                    newRow["INSTDT"] = row["INSTDT"];
-                    newRow["UPDTID"] = row["UPDTID"];
-                    newRow["UPDTDT"] = row["UPDTDT"];
+                    // INSERT（全列コピー）
+                    var newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                     dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {tancd}");
                     countInsert++;
                 }
                 else
                 {
-                    var mysTANNM = r[0]["TANNM"].ToString().Replace("_5", "");
-                    var oraTANNM = row["TANNM"].ToString().Replace("_5", "");
-                    if (oraTANNM != mysTANNM ||
-                        row["PASSWD"].ToString() != r[0]["PASSWD"].ToString() ||
-                        row["ATGCD"].ToString() != r[0]["ATGCD"].ToString() ||
-                        row["UPDTID"].ToString() != r[0]["UPDTID"].ToString() ||
-                        row["UPDTDT"].ToString() != r[0]["UPDTDT"].ToString()
+                    // 差分チェック（全列比較）
+                    var oraTANNM = oraRow["TANNM"].ToString().Replace("_5", "");
+                    var mysTANNM = myRow["TANNM"].ToString().Replace("_5", "");
+                    if (mysTANNM != oraTANNM ||
+                        myRow["PASSWD"].ToString() != oraRow["PASSWD"].ToString() ||
+                        myRow["ATGCD"].ToString() != oraRow["ATGCD"].ToString() ||
+                        myRow["INSTID"].ToString() != oraRow["INSTID"].ToString() ||
+                        myRow["INSTDT"].ToString() != oraRow["INSTDT"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString()
                         )
                     {
-                        r[0]["TANNM"] = row["TANNM"];
-                        r[0]["PASSWD"] = row["PASSWD"];
-                        r[0]["ATGCD"] = row["ATGCD"];
-                        r[0]["UPDTID"] = row["UPDTID"];
-                        r[0]["UPDTDT"] = row["UPDTDT"];
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {tancd}");
                         countUpdate++;
                     }
@@ -200,61 +250,68 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // S0820 カレンダーマスタ
+        // S0820 カレンダーマスタ（当日-30日～で4万件位）
         private static void S0820()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("S0820 カレンダーマスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from S0820 where CALTYP='00001' and YMD > '2024/10/1'";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL YMD対象を取得
+            var sqlOra = $"select * from S0820";
+            if (!isMaintenance) sqlOra += " where YMD > SYSDATE - 365";
+            dtOra.Load(new OracleCommand(sqlOra, connOracle).ExecuteReader());
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select YMD from S0820 where CALTYP='00001' and YMD > '2024/10/1'";
+            var sqlMySQL = "select * from S0820";
+            if (!isMaintenance) sqlMySQL += " where YMD > (CURRENT_DATE - interval 365 day)";
             var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => $"{r["CALTYP"]}_{r["YMD"]}", r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var ymd = row["YMD"].ToString();
-                var sql = $" select * from S0820 where CALTYP='00001' and YMD='{ymd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var caltyp = oraRow["CALTYP"].ToString();
+                var ymd = oraRow["YMD"].ToString();
+                var key = $"{oraRow["CALTYP"]}_{oraRow["YMD"]}";
 
-                if (dtMySQL.Select($"YMD='{ymd}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
-                    if (isDisp) Console.WriteLine($"Insert {ymd}");
+                    // INSERT（全列コピー）
+                    DataRow newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow; // 追加した行も辞書に入れる
+                    if (isDisp) Console.WriteLine($"Insert {caltyp} - {ymd}");
                     countInsert++;
                 }
                 else
                 {
-                    if (row["WKKBN"].ToString() != dtUpdate.Rows[0]["WKKBN"].ToString())
-                    {
-                        dtUpdate.Rows[0]["WKKBN"] = row["WKKBN"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
-                        if (isDisp) Console.WriteLine($"Update {ymd}");
+                    // 違えば UPDATE
+                    if (myRow["WKKBN"].ToString() != oraRow["WKKBN"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString())
+                        {
+                            // UPDATE（全列コピー）
+                            myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                        if (isDisp) Console.WriteLine($"Update {caltyp} - {ymd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -265,77 +322,75 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0230 得意先管理マスタ
+        // M0230 得意先管理マスタ（100件）
         private static void M0230()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0230 得意先管理マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0230";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL TKCTLNOを全件取得
+            dtOra.Load(new OracleCommand("select * from M0230", connOracle).ExecuteReader());
+
+            // MySQL を全件取得
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select TKCTLNO from M0230";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0230", connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["TKCTLNO"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var tkctlno = row["TKCTLNO"].ToString();
-                var sql = $" select * from m0230 where TKCTLNO='{tkctlno}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var tkctlno = oraRow["TKCTLNO"].ToString();
+                var key = tkctlno;
 
-                if (dtMySQL.Select($"TKCTLNO='{tkctlno}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    DataRow newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {tkctlno}");
                     countInsert++;
                 }
                 else
                 {
-                    // row["SETULEN"]==DBNull.Value を キャスト出来ない ToString()だと""になる
-                    var mysJUYMCNTstr = dtUpdate.Rows[0]["JUYMCNT"].ToString();
-                    var mysJUYMCNT = Double.Parse(mysJUYMCNTstr == "" ? "0" : mysJUYMCNTstr);
-                    var oraJUYMCNTstr = row["JUYMCNT"].ToString();
-                    var oraJUYMCNT = Double.Parse(oraJUYMCNTstr == "" ? "0" : oraJUYMCNTstr);
-                    if (row["TKCTLNM"].ToString() != dtUpdate.Rows[0]["TKCTLNM"].ToString() ||
-                        row["JUYM"].ToString() != dtUpdate.Rows[0]["JUYM"].ToString() ||
-                        oraJUYMCNT != mysJUYMCNT ||
-                        row["BFLJUYM"].ToString() != dtUpdate.Rows[0]["BFLJUYM"].ToString() ||
-                        row["LJUYM"].ToString() != dtUpdate.Rows[0]["LJUYM"].ToString() ||
-                        row["LJUINDT"].ToString() != dtUpdate.Rows[0]["LJUINDT"].ToString()
-                        )
+                    // Double 比較（JUYMCNT）
+                    var oraCnt = oraRow["JUYMCNT"].ToDoubleSafe();
+                    var myCnt = myRow["JUYMCNT"].ToDoubleSafe();
+
+                    // どれか1つでも違えば UPDATE
+                    bool isDiff =
+                        myRow["TKCTLNM"].ToString() != oraRow["TKCTLNM"].ToString() ||
+                        myRow["JUYM"].ToString() != oraRow["JUYM"].ToString() ||
+                        !myCnt.NearlyEquals(oraCnt) ||
+                        myRow["BFLJUYM"].ToString() != oraRow["BFLJUYM"].ToString() ||
+                        myRow["LJUYM"].ToString() != oraRow["LJUYM"].ToString() ||
+                        myRow["LJUINDT"].ToString() != oraRow["LJUINDT"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString();
+
+                    if (isDiff)
                     {
-                        dtUpdate.Rows[0]["TKCTLNM"] = row["TKCTLNM"];
-                        dtUpdate.Rows[0]["JUYM"] = row["JUYM"];
-                        dtUpdate.Rows[0]["JUYMCNT"] = row["JUYMCNT"];
-                        dtUpdate.Rows[0]["BFLJUYM"] = row["BFLJUYM"];
-                        dtUpdate.Rows[0]["LJUYM"] = row["LJUYM"];
-                        dtUpdate.Rows[0]["LJUINDT"] = row["LJUINDT"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {tkctlno}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -346,74 +401,70 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0220 請求先マスタ
+        // M0220 請求先マスタ（300件）
         private static void M0220()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0220 請求先マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0220";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL SKCDを全件取得
+            dtOra.Load(new OracleCommand("select * from M0220", connOracle).ExecuteReader());
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select SKCD from M0220";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0220", connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["SKCD"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var skcd = row["SKCD"].ToString();
-                var sql = $" select * from m0220 where SKCD='{skcd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var skcd = oraRow["SKCD"].ToString();
+                var key = skcd;
 
-                if (dtMySQL.Select($"SKCD='{skcd}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    DataRow newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {skcd}");
                     countInsert++;
                 }
                 else
                 {
-                    if (row["NNDAYCD"].ToString() != dtUpdate.Rows[0]["NNDAYCD"].ToString() ||
-                        row["JKDAYCD"].ToString() != dtUpdate.Rows[0]["JKDAYCD"].ToString() ||
-                        row["KINKBN"].ToString() != dtUpdate.Rows[0]["KINKBN"].ToString() ||
-                        row["KINHASUKBN"].ToString() != dtUpdate.Rows[0]["KINHASUKBN"].ToString() ||
-                        row["TAXKBN"].ToString() != dtUpdate.Rows[0]["TAXKBN"].ToString() ||
-                        row["TAXHASUKBN"].ToString() != dtUpdate.Rows[0]["TAXHASUKBN"].ToString() ||
-                        row["SKDENKBN"].ToString() != dtUpdate.Rows[0]["SKDENKBN"].ToString()
-                        )
+                    // どれか1つでも違えば UPDATE
+                    bool isDiff =
+                        myRow["NNDAYCD"].ToString() != oraRow["NNDAYCD"].ToString() ||
+                        myRow["JKDAYCD"].ToString() != oraRow["JKDAYCD"].ToString() ||
+                        myRow["KINKBN"].ToString() != oraRow["KINKBN"].ToString() ||
+                        myRow["KINHASUKBN"].ToString() != oraRow["KINHASUKBN"].ToString() ||
+                        myRow["TAXKBN"].ToString() != oraRow["TAXKBN"].ToString() ||
+                        myRow["TAXHASUKBN"].ToString() != oraRow["TAXHASUKBN"].ToString() ||
+                        myRow["SKDENKBN"].ToString() != oraRow["SKDENKBN"].ToString();
+
+                    if (isDiff)
                     {
-                        dtUpdate.Rows[0]["NNDAYCD"] = row["NNDAYCD"];
-                        dtUpdate.Rows[0]["JKDAYCD"] = row["JKDAYCD"];
-                        dtUpdate.Rows[0]["KINKBN"] = row["KINKBN"];
-                        dtUpdate.Rows[0]["KINHASUKBN"] = row["KINHASUKBN"];
-                        dtUpdate.Rows[0]["TAXKBN"] = row["TAXKBN"];
-                        dtUpdate.Rows[0]["TAXHASUKBN"] = row["TAXHASUKBN"];
-                        dtUpdate.Rows[0]["SKDENKBN"] = row["SKDENKBN"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {skcd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -424,97 +475,85 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0210 得意先マスタ
+        // M0210 得意先マスタ（300件）
         private static void M0210()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0210 得意先マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0210";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL TKCDを全件取得
+            dtOra.Load(new OracleCommand("select * from M0210", connOracle).ExecuteReader());
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select TKCD from M0210";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0210", connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["TKCD"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var tkcd = row["TKCD"].ToString();
-                var sql = $" select * from m0210 where TKCD='{tkcd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var tkcd = oraRow["TKCD"].ToString();
+                var key = tkcd;
 
-                if (dtMySQL.Select($"TKCD='{tkcd}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    var newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {tkcd}");
                     countInsert++;
                 }
                 else
                 {
-                    // row["SETULEN"]==DBNull.Value を キャスト出来ない ToString()だと""になる
-                    var mysLTstr = dtUpdate.Rows[0]["LT"].ToString();
-                    var mysLT = Double.Parse(mysLTstr == "" ? "0" : mysLTstr);
-                    var oraLTstr = row["LT"].ToString();
-                    var oraLT = Double.Parse(oraLTstr == "" ? "0" : oraLTstr);
-                    if (row["TRLT"].ToString() != dtUpdate.Rows[0]["TRLT"].ToString() ||
-                        row["TRTIME1"].ToString() != dtUpdate.Rows[0]["TRTIME1"].ToString() ||
-                        row["TRTIME2"].ToString() != dtUpdate.Rows[0]["TRTIME2"].ToString() ||
-                        row["SPDENKBN"].ToString() != dtUpdate.Rows[0]["SPDENKBN"].ToString() ||
-                        row["TKCTLNO"].ToString() != dtUpdate.Rows[0]["TKCTLNO"].ToString() ||
-                        row["CALTYP"].ToString() != dtUpdate.Rows[0]["CALTYP"].ToString() ||
-                        row["SKCD"].ToString() != dtUpdate.Rows[0]["SKCD"].ToString() ||
-                        row["PTKCD"].ToString() != dtUpdate.Rows[0]["PTKCD"].ToString() ||
-                        row["SPDAY"].ToString() != dtUpdate.Rows[0]["SPDAY"].ToString() ||
-                        row["STANCD"].ToString() != dtUpdate.Rows[0]["STANCD"].ToString() ||
-                        row["ETANCD"].ToString() != dtUpdate.Rows[0]["ETANCD"].ToString() ||
-                        row["YTANCD"].ToString() != dtUpdate.Rows[0]["YTANCD"].ToString() ||
-                        row["NJSEPKBN"].ToString() != dtUpdate.Rows[0]["NJSEPKBN"].ToString() ||
-                        row["ZENSEPDAY"].ToString() != dtUpdate.Rows[0]["ZENSEPDAY"].ToString() ||
-                        row["YGWKBN"].ToString() != dtUpdate.Rows[0]["YGWKBN"].ToString() ||
-                        oraLT != mysLT
-                        )
+                    // DBNullあり Int 安全比較（LT）
+                    var oraCnt = oraRow["LT"].ToIntNullable();
+                    var myCnt = myRow["LT"].ToIntNullable();
+
+                    // どれか1つでも違えば UPDATE
+                    bool isDiff =
+                        myRow["TRLT"].ToString() != oraRow["TRLT"].ToString() ||
+                        myRow["TRTIME1"].ToString() != oraRow["TRTIME1"].ToString() ||
+                        myRow["TRTIME2"].ToString() != oraRow["TRTIME2"].ToString() ||
+                        myRow["SPDENKBN"].ToString() != oraRow["SPDENKBN"].ToString() ||
+                        myRow["TKCTLNO"].ToString() != oraRow["TKCTLNO"].ToString() ||
+                        myRow["CALTYP"].ToString() != oraRow["CALTYP"].ToString() ||
+                        myRow["SKCD"].ToString() != oraRow["SKCD"].ToString() ||
+                        myRow["PTKCD"].ToString() != oraRow["PTKCD"].ToString() ||
+                        myRow["SPDAY"].ToString() != oraRow["SPDAY"].ToString() ||
+                        myRow["STANCD"].ToString() != oraRow["STANCD"].ToString() ||
+                        myRow["ETANCD"].ToString() != oraRow["ETANCD"].ToString() ||
+                        myRow["YTANCD"].ToString() != oraRow["YTANCD"].ToString() ||
+                        myRow["NJSEPKBN"].ToString() != oraRow["NJSEPKBN"].ToString() ||
+                        myRow["ZENSEPDAY"].ToString() != oraRow["ZENSEPDAY"].ToString() ||
+                        myRow["YGWKBN"].ToString() != oraRow["YGWKBN"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString() ||
+                         !myCnt.IntEquals(oraCnt);
+
+                    if (isDiff)
                     {
-                        dtUpdate.Rows[0]["TRLT"] = row["TRLT"];
-                        dtUpdate.Rows[0]["TRTIME1"] = row["TRTIME1"];
-                        dtUpdate.Rows[0]["TRTIME2"] = row["TRTIME2"];
-                        dtUpdate.Rows[0]["SPDENKBN"] = row["SPDENKBN"];
-                        dtUpdate.Rows[0]["TKCTLNO"] = row["TKCTLNO"];
-                        dtUpdate.Rows[0]["CALTYP"] = row["CALTYP"];
-                        dtUpdate.Rows[0]["SKCD"] = row["SKCD"];
-                        dtUpdate.Rows[0]["PTKCD"] = row["PTKCD"];
-                        dtUpdate.Rows[0]["SPDAY"] = row["SPDAY"];
-                        dtUpdate.Rows[0]["STANCD"] = row["STANCD"];
-                        dtUpdate.Rows[0]["ETANCD"] = row["ETANCD"];
-                        dtUpdate.Rows[0]["YTANCD"] = row["YTANCD"];
-                        dtUpdate.Rows[0]["NJSEPKBN"] = row["NJSEPKBN"];
-                        dtUpdate.Rows[0]["ZENSEPDAY"] = row["ZENSEPDAY"];
-                        dtUpdate.Rows[0]["YGWKBN"] = row["YGWKBN"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
-                        dtUpdate.Rows[0]["LT"] = row["LT"];
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {tkcd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -525,80 +564,74 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0200 手配先名称マスタ
+        // M0200 手配先名称マスタ（300件）
         private static void M0200()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0200 得意先名称マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0200";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL TKCDを全件取得
+            dtOra.Load(new OracleCommand("select * from M0200", connOracle).ExecuteReader());
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select TKCD from M0200";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0200", connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["TKCD"].ToString(), r => r);
+            
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var tkcd = row["TKCD"].ToString();
-                var sql = $" select * from m0200 where TKCD='{tkcd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var tkcd = oraRow["TKCD"].ToString();
+                var key = tkcd;
 
-                if (dtMySQL.Select($"TKCD='{tkcd}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    var newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {tkcd}");
                     countInsert++;
                 }
                 else
                 {
-                    if (row["TKNM1"].ToString() != dtUpdate.Rows[0]["TKNM1"].ToString() ||
-                        row["TKNM2"].ToString() != dtUpdate.Rows[0]["TKNM2"].ToString() ||
-                        row["TKRNM"].ToString() != dtUpdate.Rows[0]["TKRNM"].ToString() ||
-                        row["TKTANNM"].ToString() != dtUpdate.Rows[0]["TKTANNM"].ToString() ||
-                        row["ZIP"].ToString() != dtUpdate.Rows[0]["ZIP"].ToString() ||
-                        row["ADD1"].ToString() != dtUpdate.Rows[0]["ADD1"].ToString() ||
-                        row["ADD2"].ToString() != dtUpdate.Rows[0]["ADD2"].ToString() ||
-                        row["TEL"].ToString() != dtUpdate.Rows[0]["TEL"].ToString() ||
-                        row["FAX"].ToString() != dtUpdate.Rows[0]["FAX"].ToString() ||
-                        row["MAIL"].ToString() != dtUpdate.Rows[0]["MAIL"].ToString()
-                        )
+                    // どれか1つでも違えば UPDATE
+                    bool isDiff =
+                        myRow["TKNM1"].ToString() != oraRow["TKNM1"].ToString() ||
+                        myRow["TKNM2"].ToString() != oraRow["TKNM2"].ToString() ||
+                        myRow["TKRNM"].ToString() != oraRow["TKRNM"].ToString() ||
+                        myRow["TKTANNM"].ToString() != oraRow["TKTANNM"].ToString() ||
+                        myRow["ZIP"].ToString() != oraRow["ZIP"].ToString() ||
+                        myRow["ADD1"].ToString() != oraRow["ADD1"].ToString() ||
+                        myRow["ADD2"].ToString() != oraRow["ADD2"].ToString() ||
+                        myRow["TEL"].ToString() != oraRow["TEL"].ToString() ||
+                        myRow["FAX"].ToString() != oraRow["FAX"].ToString() ||
+                        myRow["MAIL"].ToString() != oraRow["MAIL"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString();
+                    if (isDiff)
                     {
-                        dtUpdate.Rows[0]["TKNM1"] = row["TKNM1"];
-                        dtUpdate.Rows[0]["TKNM2"] = row["TKNM2"];
-                        dtUpdate.Rows[0]["TKRNM"] = row["TKRNM"];
-                        dtUpdate.Rows[0]["TKTANNM"] = row["TKTANNM"];
-                        dtUpdate.Rows[0]["ZIP"] = row["ZIP"];
-                        dtUpdate.Rows[0]["ADD1"] = row["ADD1"];
-                        dtUpdate.Rows[0]["ADD2"] = row["ADD2"];
-                        dtUpdate.Rows[0]["TEL"] = row["TEL"];
-                        dtUpdate.Rows[0]["FAX"] = row["FAX"];
-                        dtUpdate.Rows[0]["MAIL"] = row["MAIL"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {tkcd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -609,72 +642,71 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0330 手配先管理マスタ
+        // M0330 手配先管理マスタ（60件）
         private static void M0330()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0330 手配先管理マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0330";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL ODCTLNOを全件取得
+            dtOra.Load(new OracleCommand("select * from M0330", connOracle).ExecuteReader());
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select ODCTLNO from M0330";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0330", connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["ODCTLNO"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var odctlno= row["ODCTLNO"].ToString();
-                var sql = $" select * from m0330 where ODCTLNO='{odctlno}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var odctlno= oraRow["ODCTLNO"].ToString();
+                var key = odctlno;
 
-                if (dtMySQL.Select($"ODCTLNO='{odctlno}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    DataRow newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {odctlno}");
                     countInsert++;
                 }
                 else
                 {
-                    if (row["ODCTLNM"].ToString() != dtUpdate.Rows[0]["ODCTLNM"].ToString() ||
-                        row["ODLT"].ToString() != dtUpdate.Rows[0]["ODLT"].ToString() ||
-                        row["KTDAY"].ToString() != dtUpdate.Rows[0]["KTDAY"].ToString() ||
-                        row["NJDAY"].ToString() != dtUpdate.Rows[0]["NJDAY"].ToString() ||
-                        row["CALTYP"].ToString() != dtUpdate.Rows[0]["CALTYP"].ToString() ||
-                        row["JITOKTDAY"].ToString() != dtUpdate.Rows[0]["JITOKTDAY"].ToString()
-                        )
+                    // どれか1つでも違えば UPDATE
+                    bool isDiff =
+                        myRow["ODCTLNM"].ToString() != oraRow["ODCTLNM"].ToString() ||
+                        myRow["ODLT"].ToString() != oraRow["ODLT"].ToString() ||
+                        myRow["KTDAY"].ToString() != oraRow["KTDAY"].ToString() ||
+                        myRow["NJDAY"].ToString() != oraRow["NJDAY"].ToString() ||
+                        myRow["CALTYP"].ToString() != oraRow["CALTYP"].ToString() ||
+                        myRow["JITOKTDAY"].ToString() != oraRow["JITOKTDAY"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString();
+
+                    if (isDiff)
                     {
-                        dtUpdate.Rows[0]["ODCTLNM"] = row["ODCTLNM"];
-                        dtUpdate.Rows[0]["ODLT"] = row["ODLT"];
-                        dtUpdate.Rows[0]["KTDAY"] = row["KTDAY"];
-                        dtUpdate.Rows[0]["NJDAY"] = row["NJDAY"];
-                        dtUpdate.Rows[0]["CALTYP"] = row["CALTYP"];
-                        dtUpdate.Rows[0]["JITOKTDAY"] = row["JITOKTDAY"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {odctlno}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -685,82 +717,76 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0300 手配先名称マスタ
+        // M0300 手配先名称マスタ（1000件）
         private static void M0300()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0300 手配先名称マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0300";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL ODCDを全件取得
+            dtOra.Load(new OracleCommand("select * from M0300", connOracle).ExecuteReader());
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select ODCD from M0300";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0300", connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["ODCD"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var odcd = row["ODCD"].ToString();
-                var sql = $" select * from m0300 where ODCD='{odcd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var odcd = oraRow["ODCD"].ToString();
+                var key = odcd;
 
-                if (dtMySQL.Select($"ODCD='{odcd}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    var newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {odcd}");
                     countInsert++;
                 }
                 else
                 {
-                    if (row["ODNM1"].ToString() != dtUpdate.Rows[0]["ODNM1"].ToString() ||
-                        row["ODNM2"].ToString() != dtUpdate.Rows[0]["ODNM2"].ToString() ||
-                        row["ODRNM"].ToString() != dtUpdate.Rows[0]["ODRNM"].ToString() ||
-                        row["ODTANNM"].ToString() != dtUpdate.Rows[0]["ODTANNM"].ToString() ||
-                        row["ZIP"].ToString() != dtUpdate.Rows[0]["ZIP"].ToString() ||
-                        row["ADD1"].ToString() != dtUpdate.Rows[0]["ADD1"].ToString() ||
-                        row["ADD2"].ToString() != dtUpdate.Rows[0]["ADD2"].ToString() ||
-                        row["TEL"].ToString() != dtUpdate.Rows[0]["TEL"].ToString() ||
-                        row["FAX"].ToString() != dtUpdate.Rows[0]["FAX"].ToString() ||
-                        row["MAIL"].ToString() != dtUpdate.Rows[0]["MAIL"].ToString() ||
-                        row["IOKBN"].ToString() != dtUpdate.Rows[0]["IOKBN"].ToString()
-                        )
+                    // どれか1つでも違えば UPDATE
+                    bool isDiff =
+                        myRow["ODNM1"].ToString() != oraRow["ODNM1"].ToString() ||
+                        myRow["ODNM2"].ToString() != oraRow["ODNM2"].ToString() ||
+                        myRow["ODRNM"].ToString() != oraRow["ODRNM"].ToString() ||
+                        myRow["ODTANNM"].ToString() != oraRow["ODTANNM"].ToString() ||
+                        myRow["ZIP"].ToString() != oraRow["ZIP"].ToString() ||
+                        myRow["ADD1"].ToString() != oraRow["ADD1"].ToString() ||
+                        myRow["ADD2"].ToString() != oraRow["ADD2"].ToString() ||
+                        myRow["TEL"].ToString() != oraRow["TEL"].ToString() ||
+                        myRow["FAX"].ToString() != oraRow["FAX"].ToString() ||
+                        myRow["MAIL"].ToString() != oraRow["MAIL"].ToString() ||
+                        myRow["IOKBN"].ToString() != oraRow["IOKBN"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString();
+
+                    if (isDiff)
                     {
-                        dtUpdate.Rows[0]["ODNM1"] = row["ODNM1"];
-                        dtUpdate.Rows[0]["ODNM2"] = row["ODNM2"];
-                        dtUpdate.Rows[0]["ODRNM"] = row["ODRNM"];
-                        dtUpdate.Rows[0]["ODTANNM"] = row["ODTANNM"];
-                        dtUpdate.Rows[0]["ZIP"] = row["ZIP"];
-                        dtUpdate.Rows[0]["ADD1"] = row["ADD1"];
-                        dtUpdate.Rows[0]["ADD2"] = row["ADD2"];
-                        dtUpdate.Rows[0]["TEL"] = row["TEL"];
-                        dtUpdate.Rows[0]["FAX"] = row["FAX"];
-                        dtUpdate.Rows[0]["MAIL"] = row["MAIL"];
-                        dtUpdate.Rows[0]["IOKBN"] = row["IOKBN"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {odcd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -771,146 +797,155 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0310 手配先マスタ
+        // M0310 手配先マスタ（1000件）
         private static void M0310()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0310 手配先マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0310";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL ODCDを全件取得
+            dtOra.Load(new OracleCommand("select * from M0310", connOracle).ExecuteReader());
+            var oraDict = dtOra.AsEnumerable()
+                .ToDictionary(r => r["ODCD"].ToString(), r => r);
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select ODCD from M0310";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0310", connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+            var myDict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["ODCD"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            int countDelete = 0;
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var odcd = row["ODCD"].ToString();
-                var sql = $" select * from m0310 where ODCD='{odcd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var odcd = oraRow["ODCD"].ToString();
+                var key = odcd;
 
-                if (dtMySQL.Select($"ODCD='{odcd}'").Count() == 0)
+                if (!myDict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    var newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    myDict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {odcd}");
                     countInsert++;
                 }
                 else
                 {
-                    if (row["ODGCD"].ToString() != dtUpdate.Rows[0]["ODGCD"].ToString() ||
-                        row["ODCTLNO"].ToString() != dtUpdate.Rows[0]["ODCTLNO"].ToString() ||
-                        row["SHCD"].ToString() != dtUpdate.Rows[0]["SHCD"].ToString() ||
-                        row["PODCD"].ToString() != dtUpdate.Rows[0]["PODCD"].ToString() ||
-                        row["SKOKBN"].ToString() != dtUpdate.Rows[0]["SKOKBN"].ToString() ||
-                        row["MKBN"].ToString() != dtUpdate.Rows[0]["MKBN"].ToString() ||
-                        row["YGWKTPNO"].ToString() != dtUpdate.Rows[0]["YGWKTPNO"].ToString() ||
-                        row["JODCDKBN"].ToString() != dtUpdate.Rows[0]["JODCDKBN"].ToString() 
-                        )
+                    // どれか1つでも違えば UPDATE
+                    bool isDiff =
+                        myRow["ODGCD"].ToString() != oraRow["ODGCD"].ToString() ||
+                        myRow["ODCTLNO"].ToString() != oraRow["ODCTLNO"].ToString() ||
+                        myRow["SHCD"].ToString() != oraRow["SHCD"].ToString() ||
+                        myRow["PODCD"].ToString() != oraRow["PODCD"].ToString() ||
+                        myRow["SKOKBN"].ToString() != oraRow["SKOKBN"].ToString() ||
+                        myRow["MKBN"].ToString() != oraRow["MKBN"].ToString() ||
+                        myRow["YGWKTPNO"].ToString() != oraRow["YGWKTPNO"].ToString() ||
+                        myRow["JODCDKBN"].ToString() != oraRow["JODCDKBN"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString();
+
+                    if (isDiff)
                     {
-                        dtUpdate.Rows[0]["ODGCD"] = row["ODGCD"];
-                        dtUpdate.Rows[0]["ODCTLNO"] = row["ODCTLNO"];
-                        dtUpdate.Rows[0]["SHCD"] = row["SHCD"];
-                        dtUpdate.Rows[0]["PODCD"] = row["PODCD"];
-                        dtUpdate.Rows[0]["SKOKBN"] = row["SKOKBN"];
-                        dtUpdate.Rows[0]["MKBN"] = row["MKBN"];
-                        dtUpdate.Rows[0]["YGWKTPNO"] = row["YGWKTPNO"];
-                        dtUpdate.Rows[0]["JODCDKBN"] = row["JODCDKBN"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {odcd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
+            }
+            // DELETE（Oracle に無い ODCD）
+            foreach (var kv in myDict)
+            {
+                if (!oraDict.ContainsKey(kv.Key))
+                {
+                    kv.Value.Delete();
+                    if (isDisp) Console.WriteLine($"Delete {kv.Key}");
+                    countDelete++;
+                }
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
                 Console.WriteLine("　　更新件数：" + String.Format("{0:#,0}", countUpdate) + " 件");
+                Console.WriteLine("　　削除件数：" + String.Format("{0:#,0}", countDelete) + " 件");
             }
             else
             {
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0400 工程グループマスタ
+        // M0400 工程グループマスタ（40件）
         private static void M0400()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0400 工程グループマスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0400";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL KTGCDを全件取得
+            dtOra.Load(new OracleCommand("select * from M0400", connOracle).ExecuteReader());
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select KTGCD from M0400";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0400", connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["KTGCD"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var ktgcd = row["KTGCD"].ToString();
-                var sql = $" select * from m0400 where KTGCD='{ktgcd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var ktgcd = oraRow["KTGCD"].ToString();
+                var key = ktgcd;
 
-                if (dtMySQL.Select($"KTGCD='{ktgcd}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    DataRow newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {ktgcd}");
                     countInsert++;
                 }
                 else
                 {
-                    if (row["KTGSEQ"].ToString() != dtUpdate.Rows[0]["KTGSEQ"].ToString() ||
-                        row["KTGNM"].ToString() != dtUpdate.Rows[0]["KTGNM"].ToString() ||
-                        row["KTGRNM"].ToString() != dtUpdate.Rows[0]["KTGRNM"].ToString()
-                        )
+                    // どれか1つでも違えば UPDATE
+                    bool isDiff =
+                        myRow["KTGSEQ"].ToString() != oraRow["KTGSEQ"].ToString() ||
+                        myRow["KTGNM"].ToString() != oraRow["KTGNM"].ToString() ||
+                        myRow["KTGRNM"].ToString() != oraRow["KTGRNM"].ToString();
+
+                    if (isDiff)
                     {
-                        dtUpdate.Rows[0]["KTGSEQ"] = row["KTGSEQ"];
-                        dtUpdate.Rows[0]["KTGNM"] = row["KTGNM"];
-                        dtUpdate.Rows[0]["KTGRNM"] = row["KTGRNM"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {ktgcd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -921,115 +956,94 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0410 工程マスタ
+        // M0410 工程マスタ（300件）
         private static void M0410()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine("M0410 工程マスタチェック開始");
             Console.WriteLine(Common.MSG_SEPARATOR);
+
             // Oracle
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0410";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL KTCDを全件取得
+            dtOra.Load(new OracleCommand($"select * from M0410", connOracle).ExecuteReader());
+
+            // MySQL
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select KTCD from M0410";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var myDa = new MySqlDataAdapter("select * from M0410", connMySQL);
+            var buider = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["KTCD"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var ktcd = row["KTCD"].ToString();
-                var sql = $" select * from m0410 where KTCD='{ktcd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var ktcd = oraRow["KTCD"].ToString();
+                var key = ktcd;
 
-                if (dtMySQL.Select($"KTCD='{ktcd}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    var newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {ktcd}");
                     countInsert++;
                 }
                 else
                 {
-                    // row["SETULEN"]==DBNull.Value を キャスト出来ない ToString()だと""になる
-                    var mysKTPRICEstr = dtUpdate.Rows[0]["KTPRICE"].ToString();
-                    var mysKTPRICE = Double.Parse(mysKTPRICEstr == "" ? "0" : mysKTPRICEstr);
-                    var oraKTPRICEstr = row["KTPRICE"].ToString();
-                    var oraKTPRICE = Double.Parse(oraKTPRICEstr == "" ? "0" : oraKTPRICEstr);
-                    if (row["KTNM"].ToString() != dtUpdate.Rows[0]["KTNM"].ToString() ||
-                        row["KTGCD"].ToString() != dtUpdate.Rows[0]["KTGCD"].ToString() ||
-                        row["ODCD"].ToString() != dtUpdate.Rows[0]["ODCD"].ToString() ||
-                        row["SHINDO"].ToString() != dtUpdate.Rows[0]["SHINDO"].ToString() ||
-                        row["TENKAI"].ToString() != dtUpdate.Rows[0]["TENKAI"].ToString() ||
-                        row["ODRKBN"].ToString() != dtUpdate.Rows[0]["ODRKBN"].ToString() ||
-                        row["LOTKBN"].ToString() != dtUpdate.Rows[0]["LOTKBN"].ToString() ||
-                        row["ODANLT"].ToString() != dtUpdate.Rows[0]["ODANLT"].ToString() ||
-                        row["TRIALQTY"].ToString() != dtUpdate.Rows[0]["TRIALQTY"].ToString() ||
-                        row["UNITQTY"].ToString() != dtUpdate.Rows[0]["UNITQTY"].ToString() ||
-                        row["UNITNM"].ToString() != dtUpdate.Rows[0]["UNITNM"].ToString() ||
-                        row["HUNITNM"].ToString() != dtUpdate.Rows[0]["HUNITNM"].ToString() ||
-                        row["BFLT"].ToString() != dtUpdate.Rows[0]["BFLT"].ToString() ||
-                        row["AFLT"].ToString() != dtUpdate.Rows[0]["AFLT"].ToString() ||
-                        row["IDANLT"].ToString() != dtUpdate.Rows[0]["IDANLT"].ToString() ||
-                        row["ODRLT"].ToString() != dtUpdate.Rows[0]["ODRLT"].ToString() ||
-                        row["SAFELT"].ToString() != dtUpdate.Rows[0]["SAFELT"].ToString() ||
-                        row["MOLT"].ToString() != dtUpdate.Rows[0]["MOLT"].ToString() ||
-                        row["QCLT"].ToString() != dtUpdate.Rows[0]["QCLT"].ToString() ||
-                        row["YOLT"].ToString() != dtUpdate.Rows[0]["YOLT"].ToString() ||
-                        row["JIKBN"].ToString() != dtUpdate.Rows[0]["JIKBN"].ToString() ||
-                        row["QKSKBN"].ToString() != dtUpdate.Rows[0]["QKSKBN"].ToString() ||
-                        row["BUHIN"].ToString() != dtUpdate.Rows[0]["BUHIN"].ToString() ||
-                        row["CPKTCD"].ToString() != dtUpdate.Rows[0]["CPKTCD"].ToString() ||
-                        oraKTPRICE != mysKTPRICE
-                        )
+                    // Double 比較（KTPRICE）
+                    var oraCnt = oraRow["KTPRICE"].ToDoubleSafe();
+                    var myCnt = myRow["KTPRICE"].ToDoubleSafe();
+
+                    // どれか1つでも違えば UPDATE
+                    bool isDiff =
+                        myRow["KTNM"].ToString() != oraRow["KTNM"].ToString() ||
+                        myRow["KTGCD"].ToString() != oraRow["KTGCD"].ToString() ||
+                        myRow["ODCD"].ToString() != oraRow["ODCD"].ToString() ||
+                        myRow["SHINDO"].ToString() != oraRow["SHINDO"].ToString() ||
+                        myRow["TENKAI"].ToString() != oraRow["TENKAI"].ToString() ||
+                        myRow["ODRKBN"].ToString() != oraRow["ODRKBN"].ToString() ||
+                        myRow["LOTKBN"].ToString() != oraRow["LOTKBN"].ToString() ||
+                        myRow["ODANLT"].ToString() != oraRow["ODANLT"].ToString() ||
+                        myRow["TRIALQTY"].ToString() != oraRow["TRIALQTY"].ToString() ||
+                        myRow["UNITQTY"].ToString() != oraRow["UNITQTY"].ToString() ||
+                        myRow["UNITNM"].ToString() != oraRow["UNITNM"].ToString() ||
+                        myRow["HUNITNM"].ToString() != oraRow["HUNITNM"].ToString() ||
+                        myRow["BFLT"].ToString() != oraRow["BFLT"].ToString() ||
+                        myRow["AFLT"].ToString() != oraRow["AFLT"].ToString() ||
+                        myRow["IDANLT"].ToString() != oraRow["IDANLT"].ToString() ||
+                        myRow["ODRLT"].ToString() != oraRow["ODRLT"].ToString() ||
+                        myRow["SAFELT"].ToString() != oraRow["SAFELT"].ToString() ||
+                        myRow["MOLT"].ToString() != oraRow["MOLT"].ToString() ||
+                        myRow["QCLT"].ToString() != oraRow["QCLT"].ToString() ||
+                        myRow["YOLT"].ToString() != oraRow["YOLT"].ToString() ||
+                        myRow["JIKBN"].ToString() != oraRow["JIKBN"].ToString() ||
+                        myRow["QKSKBN"].ToString() != oraRow["QKSKBN"].ToString() ||
+                        myRow["BUHIN"].ToString() != oraRow["BUHIN"].ToString() ||
+                        myRow["CPKTCD"].ToString() != oraRow["CPKTCD"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString() ||
+                        !myCnt.NearlyEquals(oraCnt);
+
+                    if (isDiff)
                     {
-                        dtUpdate.Rows[0]["KTNM"] = row["KTNM"];
-                        dtUpdate.Rows[0]["KTGCD"] = row["KTGCD"];
-                        dtUpdate.Rows[0]["ODCD"] = row["ODCD"];
-                        dtUpdate.Rows[0]["SHINDO"] = row["SHINDO"];
-                        dtUpdate.Rows[0]["TENKAI"] = row["TENKAI"];
-                        dtUpdate.Rows[0]["ODRKBN"] = row["ODRKBN"];
-                        dtUpdate.Rows[0]["LOTKBN"] = row["LOTKBN"];
-                        dtUpdate.Rows[0]["ODANLT"] = row["ODANLT"];
-                        dtUpdate.Rows[0]["TRIALQTY"] = row["TRIALQTY"];
-                        dtUpdate.Rows[0]["UNITQTY"] = row["UNITQTY"];
-                        dtUpdate.Rows[0]["UNITNM"] = row["UNITNM"];
-                        dtUpdate.Rows[0]["HUNITNM"] = row["HUNITNM"];
-                        dtUpdate.Rows[0]["BFLT"] = row["BFLT"];
-                        dtUpdate.Rows[0]["AFLT"] = row["AFLT"];
-                        dtUpdate.Rows[0]["IDANLT"] = row["IDANLT"];
-                        dtUpdate.Rows[0]["ODRLT"] = row["ODRLT"];
-                        dtUpdate.Rows[0]["SAFELT"] = row["SAFELT"];
-                        dtUpdate.Rows[0]["MOLT"] = row["MOLT"];
-                        dtUpdate.Rows[0]["QCLT"] = row["QCLT"];
-                        dtUpdate.Rows[0]["YOLT"] = row["YOLT"];
-                        dtUpdate.Rows[0]["JIKBN"] = row["JIKBN"];
-                        dtUpdate.Rows[0]["QKSKBN"] = row["QKSKBN"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
-                        dtUpdate.Rows[0]["BUHIN"] = row["BUHIN"];
-                        dtUpdate.Rows[0]["CPKTCD"] = row["CPKTCD"];
-                        dtUpdate.Rows[0]["KTPRICE"] = row["KTPRICE"];
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {ktcd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -1040,214 +1054,88 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0500 品目マスタ
+        // M0500 品目マスタ（5万件）
         private static void M0500()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine($"M0500 品目マスタチェック開始 ({day}日間)");
             Console.WriteLine(Common.MSG_SEPARATOR);
-            // Oracle 直近一週間に更新されたものを次項でチェック
+
+            // Oracle（直近更新分のみ）
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0500 where updtdt > SYSDATE - {day}"; // and hmcd = '1A7530-48630-1'";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL HMCDを全件取得
+            var sqlOra = "select * from M0500";
+            if (!isMaintenance) sqlOra += " " + $"where UPDTDT > (SYSDATE - {day})";
+            dtOra.Load(new OracleCommand(sqlOra, connOracle).ExecuteReader());
+            var hmcdList = dtOra.AsEnumerable()
+                .Select(r => r["HMCD"].ToString())
+                .Distinct()
+                .ToList();
+            if (hmcdList.Count == 0)
+            {
+                Console.WriteLine("更新はありませんでした．".PadLeft(18));
+                return;
+            }
+
+            // MySQL（直近リストから抽出）
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select HMCD from M0500";
+            string sqlMySQL = "select * from M0500";
+            if (!isMaintenance)
+            {
+                string inClause = string.Join(",", hmcdList.Select(x => $"'{x}'"));
+                sqlMySQL += " " + $"where HMCD in ({inClause})";
+            }
             var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var builder = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(r => r["HMCD"].ToString(), r => r);
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var hmcd = row["HMCD"].ToString();
-                var sql = $" select * from m0500 where hmcd='{hmcd}' ";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var hmcd = oraRow["HMCD"].ToString();
+                var key = hmcd;
 
-                if (dtMySQL.Select($"HMCD='{hmcd}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    var newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine("Insert " + hmcd);
                     countInsert++;
                 } else {
-                    // row["SETULEN"]==DBNull.Value を キャスト出来ない ToString()だと""になる
-                    var mysSKWEIGHTstr = dtUpdate.Rows[0]["SKWEIGHT"].ToString();
-                    var mysSOODstr = dtUpdate.Rows[0]["SOOD"].ToString(); 
-                    var mysSOTCstr = dtUpdate.Rows[0]["SOTC"].ToString(); 
-                    var mysSOLENstr = dtUpdate.Rows[0]["SOLEN"].ToString();
-                    var mysWEIGHTstr = dtUpdate.Rows[0]["WEIGHT"].ToString();
-                    var mysSETULENstr = dtUpdate.Rows[0]["SETULEN"].ToString();
-                    var mysSPOU1str = dtUpdate.Rows[0]["SPOU1"].ToString();
-                    var mysSPOU2str = dtUpdate.Rows[0]["SPOU2"].ToString();
-                    var mysSPOU3str = dtUpdate.Rows[0]["SPOU3"].ToString();
-                    var mysSKWEIGHT = Double.Parse(mysSKWEIGHTstr == "" ? "0" : mysSKWEIGHTstr);
-                    var mysSOOD = Double.Parse(mysSOODstr == "" ? "0" : mysSOODstr);
-                    var mysSOTC = Double.Parse(mysSOTCstr == "" ? "0" : mysSOTCstr);
-                    var mysSOLEN = Double.Parse(mysSOLENstr == "" ? "0" : mysSOLENstr);
-                    var mysWEIGHT = Double.Parse(mysWEIGHTstr == "" ? "0" : mysWEIGHTstr);
-                    var mysSETULEN = Double.Parse(mysSETULENstr == "" ? "0" : mysSETULENstr);
-                    var mysSPOU1 = Double.Parse(mysSPOU1str == "" ? "0" : mysSPOU1str);
-                    var mysSPOU2 = Double.Parse(mysSPOU2str == "" ? "0" : mysSPOU2str);
-                    var mysSPOU3 = Double.Parse(mysSPOU3str == "" ? "0" : mysSPOU3str);
-                    var oraSKWEIGHTstr = row["SKWEIGHT"].ToString();
-                    var oraSOODstr = row["SOOD"].ToString();
-                    var oraSOTCstr = row["SOTC"].ToString();
-                    var oraSOLENstr = row["SOLEN"].ToString();
-                    var oraWEIGHTstr = row["WEIGHT"].ToString();
-                    var oraSETULENstr = row["SETULEN"].ToString();
-                    var oraSPOU1str = row["SPOU1"].ToString();
-                    var oraSPOU2str = row["SPOU2"].ToString();
-                    var oraSPOU3str = row["SPOU3"].ToString();
-                    var oraSKWEIGHT = Double.Parse(oraSKWEIGHTstr == "" ? "0" : oraSKWEIGHTstr);
-                    var oraSOOD = Double.Parse(oraSOODstr == "" ? "0" : oraSOODstr);
-                    var oraSOTC = Double.Parse(oraSOTCstr == "" ? "0" : oraSOTCstr);
-                    var oraSOLEN = Double.Parse(oraSOLENstr == "" ? "0" : oraSOLENstr);
-                    var oraWEIGHT = Double.Parse(oraWEIGHTstr == "" ? "0" : oraWEIGHTstr);
-                    var oraSETULEN = Double.Parse(oraSETULENstr == "" ? "0" : oraSETULENstr);
-                    var oraSPOU1 = Double.Parse(oraSPOU1str == "" ? "0" : oraSPOU1str);
-                    var oraSPOU2 = Double.Parse(oraSPOU2str == "" ? "0" : oraSPOU2str);
-                    var oraSPOU3 = Double.Parse(oraSPOU3str == "" ? "0" : oraSPOU3str);
-                    // 変更判定
-                    if (row["HMNM"].ToString()      != dtUpdate.Rows[0]["HMNM"].ToString() ||
-                        row["HMRNM"].ToString()     != dtUpdate.Rows[0]["HMRNM"].ToString() ||
-                        row["HMTYPE"].ToString()    != dtUpdate.Rows[0]["HMTYPE"].ToString() ||
-                        row["BOMKBN"].ToString()    != dtUpdate.Rows[0]["BOMKBN"].ToString() ||
-                        row["PROCESSKBN"].ToString()!= dtUpdate.Rows[0]["PROCESSKBN"].ToString() ||
-                        row["MAKER"].ToString()     != dtUpdate.Rows[0]["MAKER"].ToString() ||
-                        row["HMKIND"].ToString()    != dtUpdate.Rows[0]["HMKIND"].ToString() ||
-                        row["MODEL"].ToString()     != dtUpdate.Rows[0]["MODEL"].ToString() ||
-                        row["ZUBAN"].ToString()     != dtUpdate.Rows[0]["ZUBAN"].ToString() ||
-                        row["HTKBN"].ToString()     != dtUpdate.Rows[0]["HTKBN"].ToString() ||
-                        row["KZAIKBN"].ToString()   != dtUpdate.Rows[0]["KZAIKBN"].ToString() ||
-                        row["ODRKBN"].ToString()    != dtUpdate.Rows[0]["ODRKBN"].ToString() ||
-                        row["MODEL"].ToString()     != dtUpdate.Rows[0]["MODEL"].ToString() ||
-                        row["ODCD1"].ToString()     != dtUpdate.Rows[0]["ODCD1"].ToString() ||
-                        row["ODCD2"].ToString()     != dtUpdate.Rows[0]["ODCD2"].ToString() ||
-                        row["BUCD"].ToString()      != dtUpdate.Rows[0]["BUCD"].ToString() ||
-                        row["BOXCD"].ToString()     != dtUpdate.Rows[0]["BOXCD"].ToString() ||
-                        row["BOXQTY"].ToString()    != dtUpdate.Rows[0]["BOXQTY"].ToString() ||
-                        row["UKCD"].ToString()      != dtUpdate.Rows[0]["UKCD"].ToString() ||
-                        row["TENKAI"].ToString()    != dtUpdate.Rows[0]["TENKAI"].ToString() ||
-                        row["SHIJI"].ToString()     != dtUpdate.Rows[0]["SHIJI"].ToString() ||
-                        row["LOTKBN"].ToString()    != dtUpdate.Rows[0]["LOTKBN"].ToString() ||
-                        row["LOTQTY"].ToString()    != dtUpdate.Rows[0]["LOTQTY"].ToString() ||
-                        row["TRIALQTY"].ToString()  != dtUpdate.Rows[0]["TRIALQTY"].ToString() ||
-                        row["CUTLT"].ToString()     != dtUpdate.Rows[0]["CUTLT"].ToString() ||
-                        row["FIXLT"].ToString()     != dtUpdate.Rows[0]["FIXLT"].ToString() ||
-                        row["HENLT"].ToString()     != dtUpdate.Rows[0]["HENLT"].ToString() ||
-                        row["TKCD"].ToString()      != dtUpdate.Rows[0]["TKCD"].ToString() ||
-                        row["QCNOTE"].ToString()    != dtUpdate.Rows[0]["QCNOTE"].ToString() ||
-                        row["NOTE"].ToString()      != dtUpdate.Rows[0]["NOTE"].ToString() ||
-                        row["SAFEQTY"].ToString()   != dtUpdate.Rows[0]["SAFEQTY"].ToString() ||
-                        row["NJSEPKBN"].ToString()  != dtUpdate.Rows[0]["NJSEPKBN"].ToString() ||
-                        row["WKNOTE"].ToString()    != dtUpdate.Rows[0]["WKNOTE"].ToString() ||
-                        row["WKCOMMENT"].ToString() != dtUpdate.Rows[0]["WKCOMMENT"].ToString() ||
-                        row["UKICD"].ToString()     != dtUpdate.Rows[0]["UKICD"].ToString() ||
-                        row["YGWKBN"].ToString()    != dtUpdate.Rows[0]["YGWKBN"].ToString() ||
-                        row["SKBOXCD"].ToString()   != dtUpdate.Rows[0]["SKBOXCD"].ToString() ||
-                        row["SKBOXQTY"].ToString()  != dtUpdate.Rows[0]["SKBOXQTY"].ToString() ||
-                        row["SKBUCD"].ToString()    != dtUpdate.Rows[0]["SKBUCD"].ToString() ||
-                        row["SKHIASU"].ToString()   != dtUpdate.Rows[0]["SKHIASU"].ToString() ||
-                        row["SKNIS"].ToString()     != dtUpdate.Rows[0]["SKNIS"].ToString() ||
-                        oraSKWEIGHT != mysSKWEIGHT ||
-                        row["SKTNOTE1"].ToString()  != dtUpdate.Rows[0]["SKTNOTE1"].ToString() ||
-                        row["SKTNOTE2"].ToString()  != dtUpdate.Rows[0]["SKTNOTE2"].ToString() ||
-                        row["SKNOTE"].ToString()    != dtUpdate.Rows[0]["SKNOTE"].ToString() ||
-                        oraSOOD != mysSOOD ||
-                        oraSOTC != mysSOTC ||
-                        oraSOLEN != mysSOLEN ||
-                        oraWEIGHT != mysWEIGHT ||
-                        row["ZAINM"].ToString() != dtUpdate.Rows[0]["ZAINM"].ToString() ||
-                        row["KJNM"].ToString() != dtUpdate.Rows[0]["KJNM"].ToString() ||
-                        oraSETULEN != mysSETULEN ||
-                        oraSPOU1 != mysSPOU1 ||
-                        oraSPOU2 != mysSPOU2 ||
-                        oraSPOU3 != mysSPOU3 ||
-                        row["WEIGHTKBN"].ToString() != dtUpdate.Rows[0]["WEIGHTKBN"].ToString()
-                        )
+                    // 差分チェック（全列比較）
+                    bool isDiff = false;
+                    for (int i = 0; i < dtOra.Columns.Count; i++)
                     {
-                        // 楽しようと思ったが・・・
-                        // dtUpdate.Clear();
-                        // dtUpdate.ImportRow(row);
-                        // dtUpdate.AcceptChanges();
-                        // dtUpdate.Rows[0].SetModified();
-                        // row.ItemArray.CopyTo(dtUpdate.Rows[0].ItemArray, 0);
-                        dtUpdate.Rows[0]["HMNM"]        = row["HMNM"];
-                        dtUpdate.Rows[0]["HMRNM"]       = row["HMRNM"];
-                        dtUpdate.Rows[0]["HMTYPE"]      = row["HMTYPE"];
-                        dtUpdate.Rows[0]["BOMKBN"]      = row["BOMKBN"];
-                        dtUpdate.Rows[0]["PROCESSKBN"]  = row["PROCESSKBN"];
-                        dtUpdate.Rows[0]["MAKER"]       = row["MAKER"];
-                        dtUpdate.Rows[0]["HMKIND"]      = row["HMKIND"];
-                        dtUpdate.Rows[0]["MODEL"]       = row["MODEL"];
-                        dtUpdate.Rows[0]["ZUBAN"]       = row["ZUBAN"];
-                        dtUpdate.Rows[0]["HTKBN"]       = row["HTKBN"];
-                        dtUpdate.Rows[0]["KZAIKBN"]     = row["KZAIKBN"];
-                        dtUpdate.Rows[0]["ODRKBN"]      = row["ODRKBN"];
-                        dtUpdate.Rows[0]["MODEL"]       = row["MODEL"];
-                        dtUpdate.Rows[0]["ODCD1"]       = row["ODCD1"];
-                        dtUpdate.Rows[0]["ODCD2"]       = row["ODCD2"];
-                        dtUpdate.Rows[0]["BUCD"]        = row["BUCD"];
-                        dtUpdate.Rows[0]["BOXCD"]       = row["BOXCD"];
-                        dtUpdate.Rows[0]["BOXQTY"]      = row["BOXQTY"];
-                        dtUpdate.Rows[0]["UKCD"]        = row["UKCD"];
-                        dtUpdate.Rows[0]["TENKAI"]      = row["TENKAI"];
-                        dtUpdate.Rows[0]["SHIJI"]       = row["SHIJI"];
-                        dtUpdate.Rows[0]["LOTKBN"]      = row["LOTKBN"];
-                        dtUpdate.Rows[0]["LOTQTY"]      = row["LOTQTY"];
-                        dtUpdate.Rows[0]["TRIALQTY"]    = row["TRIALQTY"];
-                        dtUpdate.Rows[0]["CUTLT"]       = row["CUTLT"];
-                        dtUpdate.Rows[0]["FIXLT"]       = row["FIXLT"];
-                        dtUpdate.Rows[0]["HENLT"]       = row["HENLT"];
-                        dtUpdate.Rows[0]["TKCD"]        = row["TKCD"];
-                        dtUpdate.Rows[0]["QCNOTE"]      = row["QCNOTE"];
-                        dtUpdate.Rows[0]["NOTE"]        = row["NOTE"];
-                        dtUpdate.Rows[0]["SAFEQTY"]     = row["SAFEQTY"];
-                        dtUpdate.Rows[0]["NJSEPKBN"]    = row["NJSEPKBN"];
-                        dtUpdate.Rows[0]["WKNOTE"]      = row["WKNOTE"];
-                        dtUpdate.Rows[0]["WKCOMMENT"]   = row["WKCOMMENT"];
-                        dtUpdate.Rows[0]["UKICD"]       = row["UKICD"];
-                        dtUpdate.Rows[0]["YGWKBN"]      = row["YGWKBN"];
-                        dtUpdate.Rows[0]["SKBOXCD"]     = row["SKBOXCD"];
-                        dtUpdate.Rows[0]["SKBOXQTY"]    = row["SKBOXQTY"];
-                        dtUpdate.Rows[0]["SKBUCD"]      = row["SKBUCD"];
-                        dtUpdate.Rows[0]["SKHIASU"]     = row["SKHIASU"];
-                        dtUpdate.Rows[0]["SKNIS"]       = row["SKNIS"];
-                        dtUpdate.Rows[0]["SKWEIGHT"]    = row["SKWEIGHT"];
-                        dtUpdate.Rows[0]["SKTNOTE1"]    = row["SKTNOTE1"];
-                        dtUpdate.Rows[0]["SKTNOTE2"]    = row["SKTNOTE2"];
-                        dtUpdate.Rows[0]["SKNOTE"]      = row["SKNOTE"];
-                        dtUpdate.Rows[0]["SOOD"]        = row["SOOD"];
-                        dtUpdate.Rows[0]["SOTC"]        = row["SOTC"];
-                        dtUpdate.Rows[0]["SOLEN"]       = row["SOLEN"];
-                        dtUpdate.Rows[0]["WEIGHT"]      = row["WEIGHT"];
-                        dtUpdate.Rows[0]["ZAINM"]       = row["ZAINM"];
-                        dtUpdate.Rows[0]["KJNM"]        = row["KJNM"];
-                        dtUpdate.Rows[0]["SETULEN"]     = row["SETULEN"];
-                        dtUpdate.Rows[0]["SPOU1"]       = row["SPOU1"];
-                        dtUpdate.Rows[0]["SPOU2"]       = row["SPOU2"];
-                        dtUpdate.Rows[0]["SPOU3"]       = row["SPOU3"];
-                        dtUpdate.Rows[0]["UPDTID"]      = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"]      = DateTime.Now.ToString();
-                        dtUpdate.Rows[0]["WEIGHTKBN"]   = row["WEIGHTKBN"];
+                        var col = dtOra.Columns[i].ColumnName;
+                        var oraVal = oraRow[col];
+                        var myVal = myRow[col];
+                        if (!ObjectEquals(oraVal, myVal))
+                        {
+                            isDiff = true;
+                            break;
+                        }
+                    }
+                    if (isDiff)
+                    {
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine("Update " + hmcd);
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -1257,102 +1145,212 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0520 品目構成マスタ
+        // M0520 品目構成マスタ（7万件）
         private static void M0520()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine($"M0520 品目構成マスタチェック開始 ({day}日間)");
             Console.WriteLine(Common.MSG_SEPARATOR);
-            // Oracle 直近一週間に更新されたものを次項でチェック
+            // Oracle 直近に更新されたものをチェック
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0520 where updtdt > SYSDATE - {day}";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL HMCDを全件取得
-            var dtMySQL = new DataTable();
-            var sqlMySQL = "select OYAHMCD, SEQ from M0520";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
-            myDa.Fill(dtMySQL);
+            var sqlOra = "select OYAHMCD, min(INSTDT) as MINDT, max(UPDTDT) as MAXDT from M0520 where OYAHMCD in " +
+                $"(select OYAHMCD from M0520 where UPDTDT > SYSDATE - {day}) " +
+                "group by OYAHMCD";
+            dtOra.Load(new OracleCommand(sqlOra, connOracle).ExecuteReader());
             // OracleRowを一件ずつループ
             var countInsert = 0;
             var countUpdate = 0;
-            var countDelete = 0;
             foreach (DataRow row in dtOra.Rows)
             {
                 var oyahmcd = row["OYAHMCD"].ToString();
-                var seq = row["SEQ"].ToString();
-                var ktcd = row["KTCD"].ToString();
-                var kohmcd = row["KOHMCD"].ToString();
-                var valdtf = row["VALDTF"].ToString();
-                var sql = $" select * from m0520 where OYAHMCD='{oyahmcd}' and SEQ={seq} ";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var mindt = row["MINDT"].ToString();
+                var maxdt = row["MAXDT"].ToString();
 
-                if (dtMySQL.Select($"OYAHMCD='{oyahmcd}' and SEQ={seq}").Count() == 0)
+                // MySQL OYAHMCDを取得
+                var dtMySQL = new DataTable();
+                var sqlMySQL = $"select OYAHMCD, min(INSTDT) as MINDT, max(UPDTDT) as MAXDT from M0520 where OYAHMCD='{oyahmcd}' group by OYAHMCD";
+                var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+                myDa.Fill(dtMySQL);
+                bool insertFlg = false;
+                if (dtMySQL.Rows.Count > 0)
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
-                    if (isDisp) Console.WriteLine($"Insert {oyahmcd} - {seq}");
-                    countInsert++;
+                    // 変更ありと判定された場合はMySQL側を一旦削除
+                    if (mindt != dtMySQL.Rows[0]["MINDT"].ToString() ||
+                        maxdt != dtMySQL.Rows[0]["MAXDT"].ToString())
+                    {
+                        var mpSQL = $"delete from m0520 where OYAHMCD='{oyahmcd}'";
+                        using (MySqlCommand mpCmd = new MySqlCommand(mpSQL, connMySQL))
+                        {
+                            if (isDisp) Console.WriteLine($"Update {oyahmcd}");
+                            if (isUpdate) mpCmd.ExecuteNonQuery();
+                            countUpdate++;
+                            insertFlg = true;
+                        }
+                    }
                 }
                 else
                 {
-                    if (row["BOMSEQ"].ToString()    != dtUpdate.Rows[0]["BOMSEQ"].ToString() ||
-                        row["KTCD"].ToString()      != dtUpdate.Rows[0]["KTCD"].ToString() ||
-                        row["KOHMCD"].ToString()    != dtUpdate.Rows[0]["KOHMCD"].ToString() ||
-                        row["BOMKBN"].ToString()    != dtUpdate.Rows[0]["BOMKBN"].ToString() ||
-                        row["KOQTY"].ToString()     != dtUpdate.Rows[0]["KOQTY"].ToString() ||
-                        row["OYAQTY"].ToString()    != dtUpdate.Rows[0]["OYAQTY"].ToString() ||
-                        row["VALDTF"].ToString()    != dtUpdate.Rows[0]["VALDTF"].ToString() ||
-                        row["VALDTT"].ToString()    != dtUpdate.Rows[0]["VALDTT"].ToString() 
-                        )
+                    if (isDisp) Console.WriteLine($"Insert {oyahmcd}");
+                    countInsert++;
+                    insertFlg = true;
+                }
+                if (insertFlg)
+                {
+                    // OracleのOYAHMCDを読み込んで挿入
+                    var dtOraDetail = new DataTable();
+                    dtOraDetail.Load(new OracleCommand($"select * from M0520 where OYAHMCD='{oyahmcd}'", connOracle).ExecuteReader());
+                    // Bulk Insert用
+                    List<string> m0520s = new List<string>();
+                    foreach (DataRow r in dtOraDetail.Rows)
                     {
-                        dtUpdate.Rows[0]["BOMSEQ"]  = row["BOMSEQ"];
-                        dtUpdate.Rows[0]["KTCD"]    = row["KTCD"];
-                        dtUpdate.Rows[0]["KOHMCD"]  = row["KOHMCD"];
-                        dtUpdate.Rows[0]["BOMKBN"]  = row["BOMKBN"];
-                        dtUpdate.Rows[0]["KOQTY"]   = row["KOQTY"];
-                        dtUpdate.Rows[0]["OYAQTY"]  = row["OYAQTY"];
-                        dtUpdate.Rows[0]["VALDTF"]  = row["VALDTF"];
-                        dtUpdate.Rows[0]["VALDTT"]  = row["VALDTT"];
-                        dtUpdate.Rows[0]["UPDTID"]  = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
-                        if (isDisp) Console.WriteLine($"Update {oyahmcd} - {seq}");
-                        countUpdate++;
-
-                        // 以下の対策 2023-10-17 y.w
-                        // 品目構成マスタも更新時削除されることが判明
-                        // ⇒ ①データベース制約にKTSEQを追加して対処
-                        // ⇒ ②削除明細を検索しあれば削除
-                        /*
-                        var sqlDel = $" select * from m0520 where OYAHMCD='{oyahmcd}' and KTCD='{ktcd}' and KOHMCD='{kohmcd}' and VALDTF='{valdtf}'";
-                        var adapterDel = new MySqlDataAdapter();
-                        adapterDel.SelectCommand = new MySqlCommand(sqlDel, connMySQL);
-                        var buiderDel = new MySqlCommandBuilder(adapterDel);
-                        var dtDelete = new DataTable();
-                        adapterDel.Fill(dtDelete);
-                        if (dtDelete.Rows.Count != 0)
+                        m0520s.Add(ImportMpM0520BulkData(r));
+                    }
+                    if (m0520s.Count > 0)
+                    {
+                        var BulkData = string.Join(",", m0520s.ToArray());
+                        var sql = ImportMpM0520() + BulkData;
+                        using (MySqlCommand mpCmd = new MySqlCommand(sql, connMySQL))
                         {
-                            if (isDisp)
-                                Console.WriteLine($"Delete {oyahmcd.PadRight(24)} - {ktcd} - {kohmcd} - {valdtf}");
-                            dtDelete.Rows[0].Delete();
-                            if (isUpdate) adapter.Update(dtDelete);
-                            countDelete++;
+                            try
+                            {
+                                // 追加更新を実行
+                                if (isUpdate) mpCmd.ExecuteNonQuery();
+                            }
+                            catch (Exception)
+                            {
+                                Console.Error.WriteLine($"M0520 Error Insert OYAHMCD={oyahmcd}");
+                            }
                         }
-                        */
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
+                Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
+                Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
+                Console.WriteLine("　　更新件数：" + String.Format("{0:#,0}", countUpdate) + " 件");
+            }
+            else
+            {
+                Console.WriteLine("更新はありませんでした．".PadLeft(18));
+            }
+        }
+        private static string ImportMpM0520()
+        {
+            return "Insert into m0520 " +
+                "(OYAHMCD,SEQ,BOMSEQ,KTCD,KOHMCD,BOMKBN,KOQTY,OYAQTY,VALDTF,VALDTT," +
+                "INSTID,INSTDT,UPDTID,UPDTDT)" +
+                " values ";
+        }
+        private static string ImportMpM0520BulkData(DataRow r)
+        {
+            return "("
+                + "'" + r["OYAHMCD"].ToString() + "',"
+                + r["SEQ"] + ","
+                + r["BOMSEQ"] + ","
+                + (r["KTCD"].ToString() == "" ? "null," : "'" + r["KTCD"].ToString() + "',")
+                + "'" + r["KOHMCD"].ToString() + "',"
+                + "'" + r["BOMKBN"].ToString() + "',"
+                + r["KOQTY"] + ","
+                + r["OYAQTY"] + ","
+                + "'" + r["VALDTF"] + "',"
+                + "'" + r["VALDTT"] + "',"
+                + "'" + r["INSTID"].ToString() + "',"
+                + "'" + r["INSTDT"] + "',"
+                + "'" + r["UPDTID"].ToString() + "',"
+                + "'" + r["UPDTDT"] + "'"
+                + ")";
+        }
+
+        // M0570 品目手順マスタ（7万件）
+        private static void M0570()
+        {
+            Console.WriteLine(Common.MSG_SEPARATOR);
+            Console.WriteLine($"M0570 品目手順マスタチェック開始");
+            Console.WriteLine(Common.MSG_SEPARATOR);
+
+            // Oracle 全件
+            var dtOra = new DataTable();
+            dtOra.Load(new OracleCommand("select * from M0570", connOracle).ExecuteReader());
+            var oraDict = dtOra.AsEnumerable()
+                .ToDictionary(r => $"{r["HMCD"]}_{(DateTime)r["VALDTF"]:yyyyMMdd}", r => r);
+
+            // MySQL 全件
+            var dtMy = new DataTable();
+            var myDa = new MySqlDataAdapter("select * from M0570", connMySQL);
+            var builder = new MySqlCommandBuilder(myDa);
+            myDa.Fill(dtMy);
+            var myDict = dtMy.AsEnumerable()
+                .ToDictionary(r => $"{r["HMCD"]}_{(DateTime)r["VALDTF"]:yyyyMMdd}", r => r);
+
+            int countInsert = 0;
+            int countUpdate = 0;
+            int countDelete = 0;
+            // INSERT / UPDATE
+            foreach (var kv in oraDict)
+            {
+                var key = kv.Key;
+                var oraRow = kv.Value;
+
+                if (!myDict.TryGetValue(key, out DataRow myRow))
+                {
+                    // INSERT（全列コピー）
+                    var newRow = dtMy.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMy.Rows.Add(newRow);
+                    if (isDisp) Console.WriteLine("Insert " + key);
+                    countInsert++;
+                }
+                else
+                {
+                    // 差分チェック（全列）
+                    bool isDiff = false;
+
+                    for (int i = 0; i < dtOra.Columns.Count; i++)
+                    {
+                        var col = dtOra.Columns[i].ColumnName;
+                        if (!ObjectEquals(oraRow[col], myRow[col]))
+                        {
+                            isDiff = true;
+                            break;
+                        }
+                    }
+
+                    if (isDiff)
+                    {
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                        if (isDisp) Console.WriteLine("Update " + key);
+                        countUpdate++;
+                    }
+                }
+            }
+            // DELETE（Oracle に無い行）
+            foreach (var kv in myDict)
+            {
+                if (!oraDict.ContainsKey(kv.Key))
+                {
+                    // 外部参照[FK_M0510_M0570_1]の為、M0510の実態を先に消してしまう
+                    var hmcd = kv.Key.Split('_')[0];
+                    var valdtf = kv.Key.Split('_')[1];
+                    var mpSQL = $"delete from m0510 where HMCD='{hmcd}' and VALDTF='{valdtf}'";
+                    using (MySqlCommand mpCmd = new MySqlCommand(mpSQL, connMySQL))
+                    {
+                        if (isUpdate) mpCmd.ExecuteNonQuery();
+                    }
+                    // DataTableから削除
+                    kv.Value.Delete();
+                    if (isDisp) Console.WriteLine("Delete " + hmcd + " - " + valdtf);
+                    countDelete++;
+                }
+            }
+
+            // 結果
+            if (countInsert + countUpdate + countDelete > 0)
+            {
+                // 更新
+                if (isUpdate) myDa.Update(dtMy);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
@@ -1364,212 +1362,84 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0570 品目手順マスタ
-        private static void M0570()
-        {
-            Console.WriteLine(Common.MSG_SEPARATOR);
-            Console.WriteLine($"M0570 品目手順マスタチェック開始 ({day}日間)");
-            Console.WriteLine(Common.MSG_SEPARATOR);
-            // Oracle 直近一週間に更新されたものを次項でチェック
-            var dtOra = new DataTable();
-            var sqlOra = $"select * from M0570 where updtdt > SYSDATE - {day}";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL HMCDを全件取得
-            var dtMySQL = new DataTable();
-            var sqlMySQL = "select HMCD, VALDTF from M0570";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
-            myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
-            var countInsert = 0;
-            var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
-            {
-                var hmcd = row["HMCD"].ToString();
-                var valdtf = row["VALDTF"].ToString();
-                var sql = $" select * from m0570 where HMCD='{hmcd}' and VALDTF='{valdtf}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
-
-                if (dtMySQL.Select($"HMCD='{hmcd}' and VALDTF='{valdtf}'").Count() == 0)
-                {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
-                    if (isDisp) Console.WriteLine($"Insert {hmcd} - {valdtf}");
-                    countInsert++;
-                }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
-            }
-            // 結果
-            if (countInsert + countUpdate > 0)
-            {
-                if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
-                Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
-                Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
-            }
-            else
-            {
-                Console.WriteLine("更新はありませんでした．".PadLeft(18));
-            }
-        }
-        // M0510 品目手順詳細マスタ
+        // M0510 品目手順詳細マスタ（19万件）
         private static void M0510()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine($"M0510 品目手順詳細マスタチェック開始 ({day}日間)");
             Console.WriteLine(Common.MSG_SEPARATOR);
-            // Oracle 直近一週間に更新されたものを次項でチェック
+            // Oracle 直近に更新されたものをチェック
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0510 where updtdt > SYSDATE - {day}";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL HMCDを全件取得
-            var dtMySQL = new DataTable();
-            var sqlMySQL = "select HMCD, VALDTF, KTSEQ from M0510";
-            var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
-            myDa.Fill(dtMySQL);
+            var sqlOra = $"select HMCD, VALDTF, min(INSTDT) as MINDT, MAX(UPDTDT) as MAXDT from M0510 where updtdt > SYSDATE - {day} group by HMCD, VALDTF";
+            dtOra.Load(new OracleCommand(sqlOra, connOracle).ExecuteReader());
             // OracleRowを一件ずつループ
             var countInsert = 0;
             var countUpdate = 0;
-            var countDelete = 0;
             foreach (DataRow row in dtOra.Rows)
             {
                 var hmcd = row["HMCD"].ToString();
                 var valdtf = row["VALDTF"].ToString();
-                var ktseq = row["KTSEQ"].ToString();
-                var ktcd = row["KTCD"].ToString();
-                var sql = $" select * from m0510 where HMCD='{hmcd}' and VALDTF='{valdtf}' and KTSEQ={ktseq} ";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var mindt = row["MINDT"].ToString();
+                var maxdt = row["MAXDT"].ToString();
 
-                if (dtMySQL.Select($"HMCD='{hmcd}' and VALDTF='{valdtf}' and KTSEQ={ktseq}").Count() == 0
-                 || dtUpdate.Rows.Count == 0)
+                // MySQL HMCDを取得
+                var dtMySQL = new DataTable();
+                var sqlMySQL = $"select HMCD, VALDTF, min(INSTDT) as MINDT, max(UPDTDT) as MAXDT from m0510 where HMCD='{hmcd}' and VALDTF='{valdtf}'";
+                var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+                myDa.Fill(dtMySQL);
+                bool insertFlg = false;
+                if (dtMySQL.Rows.Count > 0)
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
-                    if (isDisp) 
-                        Console.WriteLine($"Insert {hmcd.PadRight(24)} - {valdtf} - {ktseq}");
-                    countInsert++;
-                }
-                else
-                {
-                    if (row["KTCD"].ToString() != dtUpdate.Rows[0]["KTCD"].ToString() ||
-                        row["ODCD"].ToString() != dtUpdate.Rows[0]["ODCD"].ToString() ||
-                        row["SHINDO"].ToString() != dtUpdate.Rows[0]["SHINDO"].ToString() ||
-                        row["TENKAI"].ToString() != dtUpdate.Rows[0]["TENKAI"].ToString() ||
-                        row["CARD"].ToString() != dtUpdate.Rows[0]["CARD"].ToString() ||
-                        row["ODRKBN"].ToString() != dtUpdate.Rows[0]["ODRKBN"].ToString() ||
-                        row["LOTKBN"].ToString() != dtUpdate.Rows[0]["LOTKBN"].ToString() ||
-                        row["LOTQTY"].ToString() != dtUpdate.Rows[0]["LOTQTY"].ToString() ||
-                        row["ODANLT"].ToString() != dtUpdate.Rows[0]["ODANLT"].ToString() ||
-                        row["BFLT"].ToString() != dtUpdate.Rows[0]["BFLT"].ToString() ||
-                        row["AFLT"].ToString() != dtUpdate.Rows[0]["AFLT"].ToString() ||
-                        row["IDANLT"].ToString() != dtUpdate.Rows[0]["IDANLT"].ToString() ||
-                        row["ODRLT"].ToString() != dtUpdate.Rows[0]["ODRLT"].ToString() ||
-                        row["SAFELT"].ToString() != dtUpdate.Rows[0]["SAFELT"].ToString() ||
-                        row["MOLT"].ToString() != dtUpdate.Rows[0]["MOLT"].ToString() ||
-                        row["QCLT"].ToString() != dtUpdate.Rows[0]["QCLT"].ToString() ||
-                        row["YOLT"].ToString() != dtUpdate.Rows[0]["YOLT"].ToString() ||
-                        row["TRIALQTY"].ToString() != dtUpdate.Rows[0]["TRIALQTY"].ToString() ||
-                        row["UNITQTY"].ToString() != dtUpdate.Rows[0]["UNITQTY"].ToString() ||
-                        row["UNITNM"].ToString() != dtUpdate.Rows[0]["UNITNM"].ToString() ||
-                        row["HUNITNM"].ToString() != dtUpdate.Rows[0]["HUNITNM"].ToString() ||
-                        float.Parse(row["HQTY"].ToString()) != float.Parse(dtUpdate.Rows[0]["HQTY"].ToString()) ||
-                        row["KQTY"].ToString() != dtUpdate.Rows[0]["KQTY"].ToString() ||
-                        row["MCNO"].ToString() != dtUpdate.Rows[0]["MCNO"].ToString() ||
-                        row["TOOLNO"].ToString() != dtUpdate.Rows[0]["TOOLNO"].ToString() ||
-                        row["WKNOTE"].ToString() != dtUpdate.Rows[0]["WKNOTE"].ToString() ||
-                        row["WKCOMMENT"].ToString() != dtUpdate.Rows[0]["WKCOMMENT"].ToString() ||
-                        row["BOXCD"].ToString() != dtUpdate.Rows[0]["BOXCD"].ToString() ||
-                        row["SAFEQTY"].ToString() != dtUpdate.Rows[0]["SAFEQTY"].ToString() ||
-                        row["STKTKBN"].ToString() != dtUpdate.Rows[0]["STKTKBN"].ToString() ||
-                        row["EDKTKBN"].ToString() != dtUpdate.Rows[0]["EDKTKBN"].ToString() ||
-                        row["YGWKBN"].ToString() != dtUpdate.Rows[0]["YGWKBN"].ToString() ||
-                        row["JIKBN"].ToString() != dtUpdate.Rows[0]["JIKBN"].ToString() ||
-                        row["MKBN"].ToString() != dtUpdate.Rows[0]["MKBN"].ToString() ||
-                        row["HTKBN"].ToString() != dtUpdate.Rows[0]["HTKBN"].ToString() ||
-                        row["THSSKBN"].ToString() != dtUpdate.Rows[0]["THSSKBN"].ToString()
-                        )
+                    // 変更ありと判定された場合はMySQL側を一旦削除
+                    if (mindt != dtMySQL.Rows[0]["MINDT"].ToString() ||
+                        maxdt != dtMySQL.Rows[0]["MAXDT"].ToString())
                     {
-                        dtUpdate.Rows[0]["KTCD"] = row["KTCD"];
-                        dtUpdate.Rows[0]["ODCD"] = row["ODCD"];
-                        dtUpdate.Rows[0]["SHINDO"] = row["SHINDO"];
-                        dtUpdate.Rows[0]["TENKAI"] = row["TENKAI"];
-                        dtUpdate.Rows[0]["CARD"] = row["CARD"];
-                        dtUpdate.Rows[0]["ODRKBN"] = row["ODRKBN"];
-                        dtUpdate.Rows[0]["LOTKBN"] = row["LOTKBN"];
-                        dtUpdate.Rows[0]["LOTQTY"] = row["LOTQTY"];
-                        dtUpdate.Rows[0]["ODANLT"] = row["ODANLT"];
-                        dtUpdate.Rows[0]["BFLT"] = row["BFLT"];
-                        dtUpdate.Rows[0]["AFLT"] = row["AFLT"];
-                        dtUpdate.Rows[0]["IDANLT"] = row["IDANLT"];
-                        dtUpdate.Rows[0]["ODRLT"] = row["ODRLT"];
-                        dtUpdate.Rows[0]["SAFELT"] = row["SAFELT"];
-                        dtUpdate.Rows[0]["MOLT"] = row["MOLT"];
-                        dtUpdate.Rows[0]["QCLT"] = row["QCLT"];
-                        dtUpdate.Rows[0]["YOLT"] = row["YOLT"];
-                        dtUpdate.Rows[0]["TRIALQTY"] = row["TRIALQTY"];
-                        dtUpdate.Rows[0]["UNITQTY"] = row["UNITQTY"];
-                        dtUpdate.Rows[0]["UNITNM"] = row["UNITNM"];
-                        dtUpdate.Rows[0]["HUNITNM"] = row["HUNITNM"];
-                        dtUpdate.Rows[0]["HQTY"] = row["HQTY"];
-                        dtUpdate.Rows[0]["KQTY"] = row["KQTY"];
-                        dtUpdate.Rows[0]["MCNO"] = row["MCNO"];
-                        dtUpdate.Rows[0]["TOOLNO"] = row["TOOLNO"];
-                        dtUpdate.Rows[0]["WKNOTE"] = row["WKNOTE"];
-                        dtUpdate.Rows[0]["WKCOMMENT"] = row["WKCOMMENT"];
-                        dtUpdate.Rows[0]["BOXCD"] = row["BOXCD"];
-                        dtUpdate.Rows[0]["SAFEQTY"] = row["SAFEQTY"];
-                        dtUpdate.Rows[0]["STKTKBN"] = row["STKTKBN"];
-                        dtUpdate.Rows[0]["EDKTKBN"] = row["EDKTKBN"];
-                        dtUpdate.Rows[0]["YGWKBN"] = row["YGWKBN"];
-                        dtUpdate.Rows[0]["JIKBN"] = row["JIKBN"];
-                        dtUpdate.Rows[0]["MKBN"] = row["MKBN"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
-                        dtUpdate.Rows[0]["HTKBN"] = row["HTKBN"];
-                        dtUpdate.Rows[0]["THSSKBN"] = row["THSSKBN"];
-                        if (isDisp) 
-                            Console.WriteLine($"Update {hmcd.PadRight(24)} - {valdtf} - {ktseq}");
-                        countUpdate++;
-
-                        // 以下の対策 2023-09-12 y.w
-                        // 手順詳細マスタはよく削除されることが判明
-                        // Duplicate entry '94-1103-2007-01-01 00:00:00-TRWH' for key 'm0510.UQ_M0510_1'
-                        // 手順10, 20, 30 ある場合の途中の 20 が消されると UNIQE KEYが被る
-                        // ⇒ ①データベース制約にKTSEQを追加して対処
-                        // ⇒ ②削除明細を検索しあれば削除
-                        var sqlDel = $" select * from m0510 where HMCD='{hmcd}' and VALDTF='{valdtf}' and KTCD='{ktcd}' and KTSEQ!={ktseq}";
-                        var adapterDel = new MySqlDataAdapter();
-                        adapterDel.SelectCommand = new MySqlCommand(sqlDel, connMySQL);
-                        var buiderDel = new MySqlCommandBuilder(adapterDel);
-                        var dtDelete = new DataTable();
-                        adapterDel.Fill(dtDelete);
-                        if (dtDelete.Rows.Count != 0)
+                        var mpSQL = $"delete from m0510 where HMCD='{hmcd}' and VALDTF='{valdtf}'";
+                        using (MySqlCommand mpCmd = new MySqlCommand(mpSQL, connMySQL))
                         {
-                            if (isDisp)
-                                Console.WriteLine($"Delete {hmcd.PadRight(24)} - {valdtf} - {ktseq}");
-                            dtDelete.Rows[0].Delete();
-                            if (isUpdate) adapter.Update(dtDelete);
-                            countDelete++;
+                            if (isDisp) Console.WriteLine($"Update {hmcd,-24} - {valdtf}");
+                            if (isUpdate) mpCmd.ExecuteNonQuery();
+                            countUpdate++;
+                            insertFlg = true;
                         }
                     }
                 }
-
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
-
+                else
+                {
+                    if (isDisp) Console.WriteLine($"Insert {hmcd,-24} - {valdtf}");
+                    countInsert++;
+                    insertFlg = true;
+                }
+                if (insertFlg)
+                {
+                    // OracleのHMCDを読み込んで挿入
+                    var dtOraDetail = new DataTable();
+                    var sqlOraDetail = $"select * from M0510 where HMCD='{hmcd}' and VALDTF='{valdtf.Substring(0,10)}'";
+                    dtOraDetail.Load(new OracleCommand(sqlOraDetail, connOracle).ExecuteReader());
+                    // Bulk Insert用
+                    List<string> m0510s = new List<string>();
+                    foreach (DataRow r in dtOraDetail.Rows)
+                    {
+                        m0510s.Add(ImportMpM0510BulkData(r));
+                    }
+                    if (m0510s.Count > 0)
+                    {
+                        var BulkData = string.Join(",", m0510s.ToArray());
+                        var sql = ImportMpM0510() + BulkData;
+                        using (MySqlCommand mpCmd = new MySqlCommand(sql, connMySQL))
+                        {
+                            try
+                            {
+                                // 追加更新を実行
+                                if (isUpdate) mpCmd.ExecuteNonQuery();
+                            }
+                            catch (Exception)
+                            {
+                                Console.Error.WriteLine($"M0510 Error Insert HMCD={hmcd} VALDTF={valdtf}");
+                            }
+                        }
+                    }
+                }
             }
             // 結果
             if (countInsert + countUpdate > 0)
@@ -1578,72 +1448,202 @@ namespace MirrorOra2MySQL
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
                 Console.WriteLine("　　更新件数：" + String.Format("{0:#,0}", countUpdate) + " 件");
-                Console.WriteLine("　　削除件数：" + String.Format("{0:#,0}", countDelete) + " 件");
             }
             else
             {
                 Console.WriteLine("更新はありませんでした．".PadLeft(18));
             }
         }
-        // M0600 受注品マスタ
+        private static string ImportMpM0510()
+        {
+            return "Insert into m0510 " +
+                "(HMCD,VALDTF,KTSEQ,KTCD,ODCD,SHINDO,TENKAI,CARD,ODRKBN,LOTKBN," +
+                "LOTQTY,ODANLT,BFLT,AFLT,IDANLT,ODRLT,SAFELT,MOLT,QCLT,YOLT," +
+                "TRIALQTY,UNITQTY,UNITNM,HUNITNM,HQTY,KQTY,MCNO,TOOLNO,WKNOTE,WKCOMMENT," +
+                "BOXCD,SAFEQTY,STKTKBN,EDKTKBN,YGWKBN,JIKBN,MKBN,INSTID,INSTDT,UPDTID," +
+                "UPDTDT,HTKBN,THSSKBN)" +
+                " values ";
+        }
+        private static string ImportMpM0510BulkData(DataRow r)
+        {
+            return "("
+                + "'" + r["HMCD"].ToString() + "',"
+                + "'" + r["VALDTF"] + "',"
+                + r["KTSEQ"] + ","
+                + "'" + r["KTCD"].ToString() + "',"
+                + "'" + r["ODCD"].ToString() + "',"
+                + "'" + r["SHINDO"].ToString() + "',"
+                + "'" + r["TENKAI"].ToString() + "',"
+                + "'" + r["CARD"].ToString() + "',"
+                + "'" + r["ODRKBN"].ToString() + "',"
+                + "'" + r["LOTKBN"].ToString() + "',"
+                + r["LOTQTY"] + ","
+                + r["ODANLT"] + ","
+                + r["BFLT"] + ","
+                + r["AFLT"] + ","
+                + r["IDANLT"] + ","
+                + r["ODRLT"] + ","
+                + r["SAFELT"] + ","
+                + r["MOLT"] + ","
+                + r["QCLT"] + ","
+                + r["YOLT"] + ","
+                + r["TRIALQTY"] + ","
+                + r["UNITQTY"] + ","
+                + (r["UNITNM"].ToString() == "" ? "null," : "'" + r["UNITNM"].ToString() + "',")
+                + (r["HUNITNM"].ToString() == "" ? "null," : "'" + r["HUNITNM"].ToString() + "',")
+                + r["HQTY"] + ","
+                + r["KQTY"] + ","
+                + (r["MCNO"].ToString() == "" ? "null," : "'" + r["MCNO"].ToString() + "',")
+                + (r["TOOLNO"].ToString() == "" ? "null," : "'" + r["TOOLNO"].ToString() + "',")
+                + (r["WKNOTE"].ToString() == "" ? "null," : "'" + r["WKNOTE"].ToString() + "',")
+                + (r["WKCOMMENT"].ToString() == "" ? "null," : "'" + r["WKCOMMENT"].ToString() + "',")
+                + (r["BOXCD"].ToString() == "" ? "null," : "'" + r["BOXCD"].ToString() + "',")
+                + r["SAFEQTY"] + ","
+                + "'" + r["STKTKBN"].ToString() + "',"
+                + "'" + r["EDKTKBN"].ToString() + "',"
+                + "'" + r["YGWKBN"].ToString() + "',"
+                + "'" + r["JIKBN"].ToString() + "',"
+                + "'" + r["MKBN"].ToString() + "',"
+                + (r["INSTID"].ToString() == "" ? "null," : "'" + r["INSTID"].ToString() + "',")
+                + (r["INSTDT"].ToString() == "" ? "null," : "'" + r["INSTDT"].ToString() + "',")
+                + (r["UPDTID"].ToString() == "" ? "null," : "'" + r["UPDTID"].ToString() + "',")
+                + (r["UPDTDT"].ToString() == "" ? "null," : "'" + r["UPDTDT"].ToString() + "',")
+                + "'" + r["HTKBN"].ToString() + "',"
+                + "'" + r["THSSKBN"].ToString() + "'"
+                + ")";
+        }
+        // M0510 緊急メンテナンス
+        private static void M0510_MaintenanceCopy_Bulk()
+        {
+            Console.WriteLine(Common.MSG_SEPARATOR);
+            Console.WriteLine("M0510 緊急メンテナンス：Oracle → MySQL 全コピー（Bulk）開始");
+            Console.WriteLine(Common.MSG_SEPARATOR);
+
+            // Oracle 全件取得
+            var dtOra = new DataTable();
+            dtOra.Load(new OracleCommand("select * from M0510", connOracle).ExecuteReader());
+
+            // MySQL 側を TRUNCATE（超高速全削除）
+            using (var cmd = new MySqlCommand("TRUNCATE TABLE M0510", connMySQL))
+            {
+                cmd.ExecuteNonQuery();
+            }
+
+            // Bulk Insert (バッチサイズ multi-row でまとめて高速投入）
+            const int batchSize = 1000;
+            int total = dtOra.Rows.Count;
+            int processed = 0;
+
+            while (processed < total)
+            {
+                var rows = dtOra.AsEnumerable()
+                    .Skip(processed)
+                    .Take(batchSize)
+                    .ToList();
+                // Bulk Insert用
+                List<string> m0510s = new List<string>();
+                foreach (DataRow r in rows)
+                {
+                    m0510s.Add(ImportMpM0510BulkData(r));
+                }
+                var BulkData = string.Join(",", m0510s.ToArray());
+                var sql = ImportMpM0510() + BulkData;
+                using (MySqlCommand mpCmd = new MySqlCommand(sql, connMySQL))
+                {
+                    mpCmd.ExecuteNonQuery();
+                }
+                processed += rows.Count;
+                Console.WriteLine($"{processed:#,0}/{total:#,0} 件 INSERT 完了");
+            }
+
+            Console.WriteLine(Common.MSG_SEPARATOR);
+            Console.WriteLine($"Oracle 件数：{dtOra.Rows.Count:#,0} 件");
+            Console.WriteLine("MySQL へ multi-row INSERT 完了（高速）");
+        }
+
+        // M0600 受注品マスタ（6万件）
         private static void M0600()
         {
             Console.WriteLine(Common.MSG_SEPARATOR);
             Console.WriteLine($"M0600 受注品マスタチェック開始 ({day}日間)");
             Console.WriteLine(Common.MSG_SEPARATOR);
-            // Oracle
+
+            // Oracle（直近更新分のみ）
             var dtOra = new DataTable();
-            var sqlOra = $"select * from M0600 where updtdt > SYSDATE - {day}";
-            var oracleCommand = new OracleCommand(sqlOra);
-            oracleCommand.Connection = connOracle;
-            OracleDataReader oracleReader = oracleCommand.ExecuteReader();
-            dtOra.Load(oracleReader);
-            // MySQL TKCD, TKHMCD を全件取得
+            var sqlOra = "select * from M0600";
+            if (!isMaintenance) sqlOra += " " + $"where UPDTDT > (SYSDATE - {day})";
+            dtOra.Load(new OracleCommand(sqlOra, connOracle).ExecuteReader());
+            var keyList = dtOra.AsEnumerable()
+                .Select(r => new {
+                    TKCD = r["TKCD"].ToString(),
+                    TKHMCD = r["TKHMCD"].ToString()
+                })
+                .Distinct()
+                .ToList();
+            if (keyList.Count == 0)
+            {
+                Console.WriteLine("更新はありませんでした．".PadLeft(18));
+                return;
+            }
+
+            // MySQL（直近リストから抽出）
             var dtMySQL = new DataTable();
-            var sqlMySQL = "select TKCD, TKHMCD from M0600";
+            string sqlMySQL = "select * from M0600";
+            if (!isMaintenance)
+            {
+                var whereList = keyList
+                    .Select(k => $"(TKCD='{k.TKCD}' AND TKHMCD='{k.TKHMCD}')");
+                var whereClause = string.Join(" OR ", whereList);
+                sqlMySQL += " " + $"where {whereClause}";
+            }
             var myDa = new MySqlDataAdapter(sqlMySQL, connMySQL);
+            var builder = new MySqlCommandBuilder(myDa);
             myDa.Fill(dtMySQL);
-            // OracleRowを一件ずつループ
+
+            // MySQL → Dictionary（高速検索）
+            var dict = dtMySQL.AsEnumerable()
+                .ToDictionary(
+                    r => $"{r["TKCD"]}_{r["TKHMCD"]}",
+                    r => r
+                );
+
             var countInsert = 0;
             var countUpdate = 0;
-            foreach (DataRow row in dtOra.Rows)
+            foreach (DataRow oraRow in dtOra.Rows)
             {
-                var tkcd = row["TKCD"].ToString();
-                var tkhmcd = row["TKHMCD"].ToString();
-                var sql = $" select * from m0600 where TKCD='{tkcd}' and TKHMCD='{tkhmcd}'";
-                var adapter = new MySqlDataAdapter();
-                adapter.SelectCommand = new MySqlCommand(sql, connMySQL);
-                var buider = new MySqlCommandBuilder(adapter);
-                var dtUpdate = new DataTable();
-                adapter.Fill(dtUpdate);
+                var tkcd = oraRow["TKCD"].ToString();
+                var tkhmcd = oraRow["TKHMCD"].ToString();
+                var key = $"{oraRow["TKCD"]}_{oraRow["TKHMCD"]}";
 
-                if (dtMySQL.Select($"TKCD='{tkcd}' and TKHMCD='{tkhmcd}'").Count() == 0)
+                if (!dict.TryGetValue(key, out DataRow myRow))
                 {
-                    dtUpdate.ImportRow(row);
-                    dtUpdate.Rows[0].SetAdded();
+                    // INSERT（全列コピー）
+                    var newRow = dtMySQL.NewRow();
+                    newRow.ItemArray = oraRow.ItemArray.Clone() as object[];
+                    dtMySQL.Rows.Add(newRow);
+                    dict[key] = newRow;
                     if (isDisp) Console.WriteLine($"Insert {tkcd} - {tkhmcd}");
                     countInsert++;
                 }
                 else
                 {
-                    if (row["HMCD"].ToString() != dtUpdate.Rows[0]["HMCD"].ToString() ||
-                        row["TKLT"].ToString() != dtUpdate.Rows[0]["TKLT"].ToString()
-                        )
+                    if (myRow["HMCD"].ToString() != oraRow["HMCD"].ToString() ||
+                        myRow["TKLT"].ToString() != oraRow["TKLT"].ToString() ||
+                        myRow["UPDTID"].ToString() != oraRow["UPDTID"].ToString() ||
+                        myRow["UPDTDT"].ToString() != oraRow["UPDTDT"].ToString())
                     {
-                        dtUpdate.Rows[0]["HMCD"] = row["HMCD"];
-                        dtUpdate.Rows[0]["TKLT"] = row["TKLT"];
-                        dtUpdate.Rows[0]["UPDTID"] = "11014";
-                        dtUpdate.Rows[0]["UPDTDT"] = DateTime.Now.ToString();
+                        // UPDATE（全列コピー）
+                        myRow.ItemArray = oraRow.ItemArray.Clone() as object[];
                         if (isDisp) Console.WriteLine($"Update {tkcd} - {tkhmcd}");
                         countUpdate++;
                     }
                 }
-                // 追加更新を実行
-                if (isUpdate) adapter.Update(dtUpdate);
             }
             // 結果
             if (countInsert + countUpdate > 0)
             {
+                // 追加更新を実行
+                if (isUpdate) myDa.Update(dtMySQL);
                 if (isDisp) Console.WriteLine(Common.MSG_SEPARATOR);
                 Console.WriteLine("検査対象件数：" + String.Format("{0:#,0}", dtOra.Rows.Count) + " 件");
                 Console.WriteLine("新規登録件数：" + String.Format("{0:#,0}", countInsert) + " 件");
