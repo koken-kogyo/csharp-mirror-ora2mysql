@@ -56,9 +56,8 @@ namespace MirrorOra2MySQL
             {
                 isMaintenance = true;
             }
-            // 
+            // 処理開始
             DBOpen();
-            if (isMaintenance) M0510_MaintenanceCopy_Bulk();
             S0820();
             M0010();
             M0200();
@@ -75,6 +74,8 @@ namespace MirrorOra2MySQL
             M0570();
             M0510();
             M0600();
+            // 全てのマスタが最新になってから実行
+            if (isMaintenance) M0510_MaintenanceCopy_Bulk();
             connOracle.Close();
             connMySQL.Close();
             if (AssemblyState.IsDebug)
@@ -1550,7 +1551,14 @@ namespace MirrorOra2MySQL
                 var sql = ImportMpM0510() + BulkData;
                 using (MySqlCommand mpCmd = new MySqlCommand(sql, connMySQL))
                 {
-                    mpCmd.ExecuteNonQuery();
+                    try
+                    {
+                        mpCmd.ExecuteNonQuery();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"{ex.Message}\n\n{sql}");
+                    }
                 }
                 processed += rows.Count;
                 Console.WriteLine($"{processed:#,0}/{total:#,0} 件 INSERT 完了");
